@@ -115,6 +115,11 @@ pub struct PaneAgentSessionSnapshot {
     pub agent: String,
     pub kind: crate::agent_resume::AgentSessionRefKind,
     pub value: String,
+    /// argv the agent was observed running with when it reported this session,
+    /// so a resume can restore its permission mode and other launch flags.
+    /// Absent for sessions recorded before this was captured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_argv: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -339,6 +344,7 @@ fn capture_tab(
             .unwrap_or_default();
         let launch_argv = terminal.and_then(|terminal| terminal.launch_argv.clone());
         let agent_session = terminal.and_then(|terminal| {
+            let agent_launch_argv = terminal.agent_launch_argv.clone();
             if let Some(authority) = terminal.hook_authority.as_ref() {
                 if let Some(session_ref) = authority.session_ref.as_ref() {
                     return Some(PaneAgentSessionSnapshot {
@@ -346,6 +352,7 @@ fn capture_tab(
                         agent: authority.agent_label.clone(),
                         kind: session_ref.kind,
                         value: session_ref.value.clone(),
+                        launch_argv: agent_launch_argv,
                     });
                 }
             }
@@ -357,6 +364,7 @@ fn capture_tab(
                     agent: session.agent.clone(),
                     kind: session.session_ref.kind,
                     value: session.session_ref.value.clone(),
+                    launch_argv: agent_launch_argv,
                 })
         });
         panes.insert(

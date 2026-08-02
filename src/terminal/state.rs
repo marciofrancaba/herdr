@@ -142,6 +142,9 @@ pub struct TerminalState {
     pub last_agent_state_change_seq: Option<u64>,
     pub revision: u64,
     pub launch_argv: Option<Vec<String>>,
+    /// argv the agent in this pane was observed running with when it reported
+    /// its native session, used to rebuild an equivalent resume command.
+    pub agent_launch_argv: Option<Vec<String>>,
     pub respawn_shell_on_exit: bool,
     recent_agent_process_exit: Option<RecentAgentProcessExit>,
     pub pending_agent_resume_plan: Option<crate::agent_resume::AgentResumePlan>,
@@ -175,6 +178,7 @@ impl TerminalState {
             last_agent_state_change_seq: None,
             revision: 0,
             launch_argv: None,
+            agent_launch_argv: None,
             respawn_shell_on_exit: false,
             recent_agent_process_exit: None,
             pending_agent_resume_plan: None,
@@ -206,6 +210,15 @@ impl TerminalState {
     pub fn with_launch_argv(mut self, argv: Vec<String>) -> Self {
         self.launch_argv = Some(argv);
         self
+    }
+
+    /// Record the argv the pane's agent is running with. Ignores an empty argv
+    /// so a failed process read cannot erase a good record.
+    pub fn set_agent_launch_argv(&mut self, argv: Vec<String>) {
+        if argv.is_empty() {
+            return;
+        }
+        self.agent_launch_argv = Some(argv);
     }
 
     pub fn with_respawn_shell_on_exit(mut self) -> Self {
@@ -1611,6 +1624,7 @@ impl TerminalState {
         );
         self.hook_authority = None;
         self.persisted_agent_session = None;
+        self.agent_launch_argv = None;
         Some(TerminalStateMutation {
             effective_state_change: self.recompute_effective_state(
                 previous_agent_label,
@@ -1935,6 +1949,7 @@ impl TerminalState {
         self.fallback_observed_at = None;
         self.hook_authority = None;
         self.persisted_agent_session = None;
+        self.agent_launch_argv = None;
         self.agent_metadata.clear();
         self.metadata_report_agents.clear();
         self.suppressed_full_lifecycle_hook_reports.clear();

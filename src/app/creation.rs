@@ -478,6 +478,26 @@ impl App {
         Some((runtime, self.public_workspace_id(ws_idx)))
     }
 
+    /// argv of the agent currently in the foreground of `pane_id`.
+    ///
+    /// Prefers the process group leader, which is the agent itself; the other
+    /// entries are its children (hook scripts, helpers). Returns `None` when
+    /// the platform cannot read argv, so callers keep whatever they already had.
+    pub(super) fn foreground_agent_argv(
+        &self,
+        pane_id: crate::layout::PaneId,
+    ) -> Option<Vec<String>> {
+        let (ws_idx, _) = self.find_pane(pane_id)?;
+        let (runtime, _) = self.lookup_runtime(ws_idx, pane_id)?;
+        let job = crate::detect::foreground_job(runtime.child_pid()?)?;
+        let leader = job
+            .processes
+            .iter()
+            .find(|process| process.pid == job.process_group_id)
+            .or_else(|| job.processes.first())?;
+        leader.argv.clone().filter(|argv| !argv.is_empty())
+    }
+
     pub(super) fn lookup_runtime_sender(
         &self,
         ws_idx: usize,

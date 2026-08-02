@@ -84,6 +84,9 @@ pub enum AppEvent {
         seq: Option<u64>,
         session_ref: Option<crate::agent_resume::AgentSessionRef>,
         session_start_source: Option<String>,
+        /// argv the reporting agent was observed running with. Read in the
+        /// runtime-aware layer so pure state never inspects processes.
+        launch_argv: Option<Vec<String>>,
     },
     /// Display-only agent metadata was reported for a pane.
     HookMetadataReported {

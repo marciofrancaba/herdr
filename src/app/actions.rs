@@ -2827,18 +2827,31 @@ impl AppState {
                 seq,
                 session_ref,
                 session_start_source,
-            } => self
-                .update_terminal_state(pane_id, |terminal| {
-                    terminal.set_agent_session_ref_for_session_start(
-                        source,
-                        agent_label,
-                        session_ref,
-                        seq,
-                        session_start_source,
-                    )
-                })
-                .into_iter()
-                .collect(),
+                launch_argv,
+            } => {
+                // argv was read in the runtime-aware layer; record it so a
+                // later resume can rebuild an equivalent command instead of a
+                // bare `<agent> --resume <id>`.
+                let mut mutations: Vec<_> = self
+                    .update_terminal_state(pane_id, |terminal| {
+                        terminal.set_agent_session_ref_for_session_start(
+                            source,
+                            agent_label,
+                            session_ref,
+                            seq,
+                            session_start_source,
+                        )
+                    })
+                    .into_iter()
+                    .collect();
+                if let Some(launch_argv) = launch_argv {
+                    mutations.extend(self.update_terminal_state(pane_id, |terminal| {
+                        terminal.set_agent_launch_argv(launch_argv);
+                        None
+                    }));
+                }
+                mutations
+            }
             AppEvent::HookMetadataReported {
                 pane_id,
                 source,
