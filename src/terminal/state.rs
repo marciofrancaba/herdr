@@ -485,6 +485,7 @@ impl TerminalState {
                     })
             {
                 self.persisted_agent_session = None;
+                self.agent_launch_argv = None;
             }
             if let Some(agent) = agent {
                 let agent_label = crate::detect::agent_label(agent);
@@ -702,6 +703,7 @@ impl TerminalState {
             }
         }
         self.persisted_agent_session = None;
+        self.agent_launch_argv = None;
         self.hook_authority = Some(HookAuthority {
             source,
             agent_label,
@@ -1688,6 +1690,7 @@ impl TerminalState {
         self.hook_authority = None;
         if !preserve_foreign_persisted_session {
             self.persisted_agent_session = None;
+            self.agent_launch_argv = None;
         }
         let current_session = self.current_session_identity_for_persistence();
         Some(TerminalStateMutation {

@@ -542,6 +542,13 @@ fn restore_tab(
             }
             if let Some(session) = restored_agent_session {
                 terminal.set_persisted_agent_session(session);
+                // Carry the recorded argv back onto the terminal, or the next
+                // snapshot writes None and the launch flags are lost on a
+                // round-trip - which is exactly what happens with
+                // resume_agents_on_restore = false.
+                if let Some(argv) = saved_agent_session.and_then(|s| s.launch_argv.clone()) {
+                    terminal.set_agent_launch_argv(argv);
+                }
             }
             match (saved_agent_name, saved_managed_agent) {
                 (Some(agent_name), Some(agent)) => {
@@ -636,6 +643,13 @@ fn restore_tab(
                 }
                 if let Some(session) = restored_agent_session {
                     terminal.set_persisted_agent_session(session);
+                    // Carry the recorded argv back onto the terminal, or the next
+                    // snapshot writes None and the launch flags are lost on a
+                    // round-trip - which is exactly what happens with
+                    // resume_agents_on_restore = false.
+                    if let Some(argv) = saved_agent_session.and_then(|s| s.launch_argv.clone()) {
+                        terminal.set_agent_launch_argv(argv);
+                    }
                 }
                 match (saved_agent_name, saved_managed_agent) {
                     (Some(agent_name), Some(agent)) if was_imported => {

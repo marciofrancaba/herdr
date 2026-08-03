@@ -207,15 +207,19 @@ pub fn plan(source: &str, agent: &str, session_ref: &AgentSessionRef) -> Option<
     })
 }
 
-/// Resume plan that keeps the flags the agent was originally launched with.
+/// Resume plan that restores the session-mode flags the agent was running with.
 ///
-/// `plan` alone rebuilds a canonical `<agent> <resume-selector> <id>` command,
-/// which silently drops everything else the pane was started with. Permission
-/// mode is the case that matters: resuming a `--dangerously-skip-permissions`
-/// session without that flag downgrades it to interactive prompts, and the
-/// operator only finds out when the agent stops at a prompt it never had
-/// before. `launch_argv` is the argv observed when the agent reported its
-/// session, so replaying its flags restores the session as it was running.
+/// `plan` alone rebuilds a canonical `<agent> <resume-selector> <id>`, which
+/// silently drops the mode the pane was operating in. Permission mode is the
+/// case that matters: resuming a `--dangerously-skip-permissions` session
+/// without that flag downgrades it to interactive prompts, and the operator
+/// only finds out when an unattended agent stops at a prompt it never had.
+///
+/// Only the flags in [`session_mode_flags`] are replayed. Replaying the whole
+/// saved argv is not safe: it has no notion of flag arity or subcommand scope,
+/// so `codex resume --last` becomes `codex --last resume <id>`, which clap
+/// rejects outright, and an initial prompt positional gets re-sent on every
+/// restart.
 pub fn plan_with_launch_argv(
     source: &str,
     agent: &str,
@@ -223,62 +227,73 @@ pub fn plan_with_launch_argv(
     launch_argv: Option<&[String]>,
 ) -> Option<AgentResumePlan> {
     let mut plan = plan(source, agent, session_ref)?;
-    if let Some(merged) = launch_argv.and_then(|saved| merge_launch_flags(&plan.argv, saved)) {
-        plan.argv = merged;
+    if let Some(saved) = launch_argv {
+        if let Some(argv) = replay_session_mode_flags(&plan.argv, saved, source, agent) {
+            plan.argv = argv;
+        }
     }
     Some(plan)
 }
 
-/// Splice the saved launch flags into the canonical resume command.
+/// Flags that describe how a session RUNS, not what it does.
 ///
-/// Keeps `[program] + [saved flags] + [canonical resume args]`. The agent's own
-/// resume selector is dropped from the saved side so a pane that was already
-/// resumed cannot accumulate a stale session id alongside the current one.
-/// Returns `None` when the saved argv cannot be trusted, leaving the canonical
-/// command untouched.
-fn merge_launch_flags(canonical: &[String], saved: &[String]) -> Option<Vec<String>> {
+/// Deliberately short. Every entry must be (a) a root-level flag for that
+/// agent, so its position relative to a subcommand is unambiguous, and (b)
+/// valueless, so no arity rule is needed. Anything outside this list is dropped:
+/// a resumed pane is rebuilt, not replayed.
+fn session_mode_flags(source: &str, agent: &str) -> &'static [&'static str] {
+    match (source, agent) {
+        ("herdr:claude", "claude") => &["--dangerously-skip-permissions"],
+        ("herdr:codex", "codex") => &["--dangerously-bypass-approvals-and-sandbox"],
+        ("herdr:copilot", "copilot") => &["--allow-all-tools"],
+        ("herdr:droid", "droid") => &["--auto"],
+        _ => &[],
+    }
+}
+
+/// Rebuild the resume command as `[program] + [session-mode flags] + [resume args]`.
+///
+/// Returns `None` when there is nothing to add or the saved argv cannot be
+/// trusted, leaving the canonical command untouched — always a safe fallback,
+/// since it is exactly the pre-existing behaviour.
+fn replay_session_mode_flags(
+    canonical: &[String],
+    saved: &[String],
+    source: &str,
+    agent: &str,
+) -> Option<Vec<String>> {
     let program = canonical.first()?;
     let resume_args = canonical.get(1..)?;
-    // A different program means the pane was not running this agent directly
-    // (a wrapper, a shell function, a stale record). Do not guess.
-    if saved.first()? != program {
+
+    // A different argv[0] means the pane was not running this agent directly
+    // (a wrapper, a shell function, a stale record). Compare on the file name
+    // so an absolute path still matches.
+    let saved_program = saved.first()?;
+    let basename = |value: &str| {
+        value
+            .rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(value)
+            .to_string()
+    };
+    if basename(saved_program) != basename(program) {
         return None;
     }
 
-    let selector = resume_args.first()?;
-    // Selectors come in two shapes: `--resume <id>` (value in the next token)
-    // and `--resume=<id>` (value inline).
-    let inline_key = selector.split_once('=').map(|(key, _)| format!("{key}="));
-
-    let mut extras: Vec<String> = Vec::new();
-    let mut skip_next_value = false;
+    let allowed = session_mode_flags(source, agent);
+    let mut flags: Vec<String> = Vec::new();
     for token in &saved[1..] {
-        if skip_next_value {
-            skip_next_value = false;
-            // Only a positional token is the selector's value; a flag means the
-            // selector was passed without one.
-            if !token.starts_with('-') {
-                continue;
-            }
+        if allowed.contains(&token.as_str()) && !flags.iter().any(|f| f == token) {
+            flags.push(token.clone());
         }
-        match &inline_key {
-            Some(key) if token.starts_with(key.as_str()) => continue,
-            None if token == selector => {
-                skip_next_value = true;
-                continue;
-            }
-            _ => {}
-        }
-        extras.push(token.clone());
     }
-
-    if extras.is_empty() {
+    if flags.is_empty() {
         return None;
     }
 
-    let mut argv = Vec::with_capacity(1 + extras.len() + resume_args.len());
+    let mut argv = Vec::with_capacity(1 + flags.len() + resume_args.len());
     argv.push(program.clone());
-    argv.extend(extras);
+    argv.extend(flags);
     argv.extend(resume_args.iter().cloned());
     Some(argv)
 }
@@ -351,50 +366,26 @@ mod tests {
         parts.iter().map(|part| (*part).to_string()).collect()
     }
 
-    fn claude_plan(launch_argv: Option<&[String]>) -> Vec<String> {
+    fn resume_argv(agent: &str, saved: Option<&[String]>) -> Vec<String> {
         plan_with_launch_argv(
-            "herdr:claude",
-            "claude",
+            &format!("herdr:{agent}"),
+            agent,
             &AgentSessionRef::id("new-session").unwrap(),
-            launch_argv,
+            saved,
         )
         .unwrap()
         .argv
     }
 
     #[test]
-    fn resume_keeps_permission_mode_from_the_original_launch() {
-        // The case that motivates this: a pane started with bypassed
-        // permissions must not come back with interactive prompts.
-        let saved = argv(&[
-            "claude",
-            "--dangerously-skip-permissions",
-            "--model",
-            "opus",
-        ]);
+    fn resume_restores_permission_mode() {
+        // The case that motivates this: a pane running with permissions
+        // bypassed must not come back with interactive prompts.
         assert_eq!(
-            claude_plan(Some(&saved)),
-            argv(&[
+            resume_argv(
                 "claude",
-                "--dangerously-skip-permissions",
-                "--model",
-                "opus",
-                "--resume",
-                "new-session"
-            ])
-        );
-    }
-
-    #[test]
-    fn resume_replaces_a_stale_session_id_instead_of_accumulating_one() {
-        let saved = argv(&[
-            "claude",
-            "--dangerously-skip-permissions",
-            "--resume",
-            "old-session",
-        ]);
-        assert_eq!(
-            claude_plan(Some(&saved)),
+                Some(&argv(&["claude", "--dangerously-skip-permissions"]))
+            ),
             argv(&[
                 "claude",
                 "--dangerously-skip-permissions",
@@ -402,26 +393,16 @@ mod tests {
                 "new-session"
             ])
         );
-    }
-
-    #[test]
-    fn resume_handles_subcommand_and_inline_selectors() {
-        // codex puts the selector in a subcommand, copilot inlines the value.
-        let codex = argv(&[
-            "codex",
-            "--dangerously-bypass-approvals-and-sandbox",
-            "resume",
-            "old-session",
-        ]);
         assert_eq!(
-            plan_with_launch_argv(
-                "herdr:codex",
+            resume_argv(
                 "codex",
-                &AgentSessionRef::id("new-session").unwrap(),
-                Some(&codex),
-            )
-            .unwrap()
-            .argv,
+                Some(&argv(&[
+                    "codex",
+                    "--dangerously-bypass-approvals-and-sandbox",
+                    "resume",
+                    "old-session"
+                ]))
+            ),
             argv(&[
                 "codex",
                 "--dangerously-bypass-approvals-and-sandbox",
@@ -429,44 +410,114 @@ mod tests {
                 "new-session"
             ])
         );
+    }
 
-        let copilot = argv(&["copilot", "--allow-all-tools", "--resume=old-session"]);
+    #[test]
+    fn resume_drops_subcommand_scoped_flags() {
+        // Regression: replaying every token hoisted `--last` ahead of the
+        // subcommand, producing `codex --last resume <id>`, which clap rejects
+        // with "unexpected argument '--last'" - a pane that failed to launch
+        // where the plain canonical command had worked.
+        let saved = argv(&["codex", "resume", "--last"]);
         assert_eq!(
-            plan_with_launch_argv(
-                "herdr:copilot",
-                "copilot",
-                &AgentSessionRef::id("new-session").unwrap(),
-                Some(&copilot),
-            )
-            .unwrap()
-            .argv,
-            argv(&["copilot", "--allow-all-tools", "--resume=new-session"])
+            resume_argv("codex", Some(&saved)),
+            argv(&["codex", "resume", "new-session"])
+        );
+        assert!(!resume_argv("codex", Some(&saved)).contains(&"--last".to_string()));
+    }
+
+    #[test]
+    fn resume_never_replays_a_positional_prompt() {
+        // An initial prompt must not be re-sent on every restart.
+        let saved = argv(&[
+            "claude",
+            "--dangerously-skip-permissions",
+            "fix the flaky test",
+        ]);
+        assert_eq!(
+            resume_argv("claude", Some(&saved)),
+            argv(&[
+                "claude",
+                "--dangerously-skip-permissions",
+                "--resume",
+                "new-session"
+            ])
         );
     }
 
     #[test]
-    fn resume_falls_back_to_the_canonical_command_when_argv_is_untrustworthy() {
-        let canonical = argv(&["claude", "--resume", "new-session"]);
-        // No saved argv at all (sessions recorded before this was captured).
-        assert_eq!(claude_plan(None), canonical);
-        // Nothing to add beyond the selector.
+    fn resume_cannot_leak_a_stale_session_selector() {
+        // Selector spellings are simply never on the allowlist, so no stripping
+        // rule has to enumerate them.
+        for saved in [
+            argv(&["claude", "--resume", "old-session"]),
+            argv(&["claude", "--resume=old-session"]),
+            argv(&["claude", "-r", "old-session"]),
+            argv(&["claude", "--continue"]),
+        ] {
+            let out = resume_argv("claude", Some(&saved));
+            assert!(!out.iter().any(|t| t.contains("old-session")), "{out:?}");
+            assert_eq!(out.iter().filter(|t| t.as_str() == "--resume").count(), 1);
+        }
+    }
+
+    #[test]
+    fn resume_matches_the_agent_on_file_name_not_full_path() {
         assert_eq!(
-            claude_plan(Some(&argv(&["claude", "--resume", "old-session"]))),
+            resume_argv(
+                "claude",
+                Some(&argv(&[
+                    "/opt/homebrew/bin/claude",
+                    "--dangerously-skip-permissions"
+                ]))
+            ),
+            argv(&[
+                "claude",
+                "--dangerously-skip-permissions",
+                "--resume",
+                "new-session"
+            ])
+        );
+    }
+
+    #[test]
+    fn resume_falls_back_to_the_canonical_command() {
+        let canonical = argv(&["claude", "--resume", "new-session"]);
+        // No saved argv (sessions recorded before capture existed).
+        assert_eq!(resume_argv("claude", None), canonical);
+        // Nothing on the allowlist present.
+        assert_eq!(
+            resume_argv("claude", Some(&argv(&["claude", "--verbose"]))),
             canonical
         );
         // A wrapper process, not the agent binary.
         assert_eq!(
-            claude_plan(Some(&argv(&["nono", "claude", "--yolo"]))),
+            resume_argv("claude", Some(&argv(&["nono", "claude", "--yolo"]))),
             canonical
         );
-        assert_eq!(claude_plan(Some(&[])), canonical);
+        assert_eq!(resume_argv("claude", Some(&[])), canonical);
+        // A flag belonging to a different agent is not replayed.
+        assert_eq!(
+            resume_argv(
+                "claude",
+                Some(&argv(&[
+                    "claude",
+                    "--dangerously-bypass-approvals-and-sandbox"
+                ]))
+            ),
+            canonical
+        );
     }
 
     #[test]
-    fn resume_does_not_swallow_a_flag_following_a_valueless_selector() {
-        let saved = argv(&["claude", "--resume", "--dangerously-skip-permissions"]);
+    fn resume_does_not_duplicate_a_repeated_flag() {
+        let saved = argv(&[
+            "claude",
+            "--dangerously-skip-permissions",
+            "--dangerously-skip-permissions",
+        ]);
         assert_eq!(
-            claude_plan(Some(&saved)),
+            resume_argv("claude", Some(&saved)),
             argv(&[
                 "claude",
                 "--dangerously-skip-permissions",
