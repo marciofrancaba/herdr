@@ -1,6 +1,8 @@
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts import agent_detection_manifest_check as check
 
@@ -27,23 +29,51 @@ path = "{path}"
 '''
 
 
-def staged_grok_dirs(root: Path) -> tuple[Path, Path]:
+STAGED_BUNDLED_MANIFEST = manifest("codex", "2026.06.10.2").replace(
+    "min_engine_version = 1", "min_engine_version = 2"
+)
+STAGED_PUBLISHED_MANIFEST = manifest("codex", "2026.06.10.1")
+STAGED_TEST_EXCEPTION = {
+    "codex": (
+        "2026.06.10.2",
+        "2026.06.10.1",
+        hashlib.sha256(STAGED_PUBLISHED_MANIFEST.encode()).hexdigest(),
+    ),
+}
+
+
+def staged_manifest_dirs(root: Path) -> tuple[Path, Path]:
     bundled = root / "bundled"
-    website = root / "website"
+    published = root / "published"
     bundled.mkdir()
-    website.mkdir()
-    (bundled / "grok.toml").write_bytes(
-        (check.DEFAULT_BUNDLED_DIR / "grok.toml").read_bytes()
-    )
-    (website / "grok.toml").write_bytes(
-        (check.DEFAULT_WEBSITE_DIR / "grok.toml").read_bytes()
-    )
-    (website / "index.toml").write_text(catalog("grok", "grok.toml"))
-    return bundled, website
+    published.mkdir()
+    (bundled / "codex.toml").write_text(STAGED_BUNDLED_MANIFEST, encoding="utf-8", newline="\n")
+    (published / "codex.toml").write_text(STAGED_PUBLISHED_MANIFEST, encoding="utf-8", newline="\n")
+    (published / "index.toml").write_text(catalog())
+    return bundled, published
+
+
+UNPUBLISHED_TEST_MANIFEST = manifest("testagent", "2026.06.10.1")
+UNPUBLISHED_TEST_EXCEPTION = {
+    "testagent": (
+        "2026.06.10.1",
+        hashlib.sha256(UNPUBLISHED_TEST_MANIFEST.encode()).hexdigest(),
+    ),
+}
+
+
+def unpublished_manifest_dirs(root: Path) -> tuple[Path, Path]:
+    bundled = root / "bundled"
+    published = root / "published"
+    bundled.mkdir()
+    published.mkdir()
+    (bundled / "testagent.toml").write_text(UNPUBLISHED_TEST_MANIFEST, encoding="utf-8", newline="\n")
+    (published / "index.toml").write_text("schema_version = 1\nagents = []\n")
+    return bundled, published
 
 
 class AgentDetectionManifestCheckTests(unittest.TestCase):
-    def test_validates_bundled_and_matching_website_catalog(self):
+    def test_validates_bundled_and_matching_published_catalog(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             bundled = root / "bundled"
@@ -58,7 +88,7 @@ class AgentDetectionManifestCheckTests(unittest.TestCase):
             bundled_manifests = check.load_manifest_dir(bundled, engine_version=1)
             check.validate_catalog(website, bundled_manifests, engine_version=1)
 
-    def test_rejects_website_version_lower_than_bundled(self):
+    def test_rejects_published_version_lower_than_bundled(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             bundled = root / "bundled"
@@ -73,24 +103,26 @@ class AgentDetectionManifestCheckTests(unittest.TestCase):
             with self.assertRaisesRegex(check.CheckError, "lower than bundled"):
                 check.validate_catalog(website, bundled_manifests, engine_version=1)
 
-    def test_allows_explicitly_staged_website_manifest(self):
+    @patch.dict(check.STAGED_PUBLISHED_MANIFESTS, STAGED_TEST_EXCEPTION, clear=True)
+    def test_allows_explicitly_staged_published_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
-            bundled, website = staged_grok_dirs(Path(tmp))
+            bundled, website = staged_manifest_dirs(Path(tmp))
 
-            bundled_manifests = check.load_manifest_dir(bundled, engine_version=3)
-            check.validate_catalog(website, bundled_manifests, engine_version=3)
+            bundled_manifests = check.load_manifest_dir(bundled, engine_version=2)
+            check.validate_catalog(website, bundled_manifests, engine_version=2)
 
-    def test_rejects_mutated_staged_website_manifest(self):
+    @patch.dict(check.STAGED_PUBLISHED_MANIFESTS, STAGED_TEST_EXCEPTION, clear=True)
+    def test_rejects_mutated_staged_published_manifest(self):
         with tempfile.TemporaryDirectory() as tmp:
-            bundled, website = staged_grok_dirs(Path(tmp))
-            with (website / "grok.toml").open("a") as manifest_file:
+            bundled, website = staged_manifest_dirs(Path(tmp))
+            with (website / "codex.toml").open("a") as manifest_file:
                 manifest_file.write("\n# unexpected mutation\n")
 
-            bundled_manifests = check.load_manifest_dir(bundled, engine_version=3)
+            bundled_manifests = check.load_manifest_dir(bundled, engine_version=2)
             with self.assertRaisesRegex(check.CheckError, "lower than bundled"):
-                check.validate_catalog(website, bundled_manifests, engine_version=3)
+                check.validate_catalog(website, bundled_manifests, engine_version=2)
 
-    def test_rejects_unlisted_website_manifest_lag_for_new_engine(self):
+    def test_rejects_unlisted_published_manifest_lag_for_new_engine(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             bundled = root / "bundled"
@@ -122,6 +154,41 @@ class AgentDetectionManifestCheckTests(unittest.TestCase):
             bundled_manifests = check.load_manifest_dir(bundled, engine_version=1)
             with self.assertRaisesRegex(check.CheckError, "same version"):
                 check.validate_catalog(website, bundled_manifests, engine_version=1)
+
+    @patch.dict(check.UNPUBLISHED_BUNDLED_MANIFESTS, UNPUBLISHED_TEST_EXCEPTION, clear=True)
+    def test_allows_exact_unpublished_bundled_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundled, published = unpublished_manifest_dirs(Path(tmp))
+            bundled_manifests = check.load_manifest_dir(bundled, engine_version=3)
+            check.validate_catalog(
+                published,
+                bundled_manifests,
+                engine_version=3,
+                allow_unpublished=True,
+            )
+
+    @patch.dict(check.UNPUBLISHED_BUNDLED_MANIFESTS, UNPUBLISHED_TEST_EXCEPTION, clear=True)
+    def test_release_gate_rejects_exact_unpublished_bundled_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundled, published = unpublished_manifest_dirs(Path(tmp))
+            bundled_manifests = check.load_manifest_dir(bundled, engine_version=3)
+            with self.assertRaisesRegex(check.CheckError, "missing bundled agent"):
+                check.validate_catalog(published, bundled_manifests, engine_version=3)
+
+    @patch.dict(check.UNPUBLISHED_BUNDLED_MANIFESTS, UNPUBLISHED_TEST_EXCEPTION, clear=True)
+    def test_rejects_mutated_unpublished_bundled_manifest(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bundled, published = unpublished_manifest_dirs(Path(tmp))
+            with (bundled / "testagent.toml").open("a") as manifest_file:
+                manifest_file.write("\n# unexpected mutation\n")
+            bundled_manifests = check.load_manifest_dir(bundled, engine_version=3)
+            with self.assertRaisesRegex(check.CheckError, "missing bundled agent"):
+                check.validate_catalog(
+                    published,
+                    bundled_manifests,
+                    engine_version=3,
+                    allow_unpublished=True,
+                )
 
     def test_rejects_unknown_catalog_agent(self):
         with tempfile.TemporaryDirectory() as tmp:

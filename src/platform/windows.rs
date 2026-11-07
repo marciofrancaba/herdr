@@ -3,64 +3,512 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     ffi::{c_void, OsStr},
     mem::{size_of, MaybeUninit},
+    os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     path::PathBuf,
     ptr::{copy_nonoverlapping, null_mut},
     sync::{
-        atomic::{AtomicU64, Ordering as AtomicOrdering},
-        Arc, LazyLock, Mutex,
+        atomic::{AtomicU32, AtomicU64, Ordering as AtomicOrdering},
+        Arc, LazyLock, Mutex, OnceLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+mod clipboard_image;
+mod config_backup;
+mod notifications;
+pub(crate) use notifications::{
+    foreground_desktop_notification_host, maybe_activate_desktop_notification,
+    show_actionable_desktop_notification, show_desktop_notification,
+};
+
+static ALLOW_UNELEVATED_CLIENTS: OnceLock<bool> = OnceLock::new();
+
+pub(crate) fn allow_unelevated_clients() {
+    let _ = ALLOW_UNELEVATED_CLIENTS.set(true);
+}
+
+pub(crate) fn probe_local_server(path: &std::path::Path) -> std::io::Result<()> {
+    use interprocess::os::windows::named_pipe::{pipe_mode::Bytes, DuplexPipeStream};
+    use interprocess::ConnectWaitMode;
+
+    // The local-socket wrapper ignores wait_mode on Windows in interprocess
+    // 2.4.2. Its named-pipe API honors it without importing/reopening a handle.
+    let name = format!(r"\\.\pipe\{}", path.to_string_lossy());
+    DuplexPipeStream::<Bytes>::connect_by_path_with_wait_mode(
+        name.as_str(),
+        ConnectWaitMode::Timeout(Duration::from_millis(500)),
+    )
+    .map(|_| ())
+    .map_err(local_server_connection_error)
+}
+
+pub(crate) fn local_server_security_descriptor(
+) -> std::io::Result<interprocess::os::windows::security_descriptor::SecurityDescriptor> {
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    let mut elevation = TOKEN_ELEVATION::default();
+    let mut needed = 0;
+    if unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenElevation,
+            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+            size_of::<TOKEN_ELEVATION>() as u32,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let allow_unelevated = ALLOW_UNELEVATED_CLIENTS.get().copied().unwrap_or(false);
+    let integrity = if elevation.TokenIsElevated != 0 && !allow_unelevated {
+        "HI"
+    } else {
+        "ME"
+    };
+    // The account DACL alone cannot distinguish ordinary and elevated clients.
+    // The integrity label blocks both reading and writing from lower levels.
+    user_security_descriptor("GRGW", &format!("S:(ML;;NRNW;;;{integrity})"))
+}
+
+fn user_security_descriptor(
+    access: &str,
+    integrity_label: &str,
+) -> std::io::Result<interprocess::os::windows::security_descriptor::SecurityDescriptor> {
+    use interprocess::os::windows::security_descriptor::SecurityDescriptor;
+    use widestring::{U16CStr, U16CString};
+    use windows_sys::Win32::Security::{
+        Authorization::ConvertSidToStringSidW, GetTokenInformation, TokenUser, TOKEN_QUERY,
+        TOKEN_USER,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let mut token = null_mut();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let token = unsafe { OwnedHandle::from_raw_handle(token) };
+    let mut needed = 0;
+    unsafe { GetTokenInformation(token.as_raw_handle(), TokenUser, null_mut(), 0, &mut needed) };
+    if needed == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // usize storage keeps TOKEN_USER aligned and its trailing SID alive.
+    let mut buffer = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
+    if unsafe {
+        GetTokenInformation(
+            token.as_raw_handle(),
+            TokenUser,
+            buffer.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: GetTokenInformation initialized the aligned TOKEN_USER and SID.
+    let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+    let mut sid = null_mut();
+    if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut sid) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let sid_text = unsafe { U16CStr::from_ptr_str(sid) }.to_string_lossy();
+    unsafe { LocalFree(sid.cast()) };
+    // Use the account SID rather than the elevated token's Administrators owner.
+    let sddl = U16CString::from_str(format!(
+        "D:P(A;;GA;;;SY)(A;;{access};;;{sid_text}){integrity_label}"
+    ))
+    .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+    SecurityDescriptor::deserialize(&sddl)
+}
+
+pub(crate) fn local_server_connection_error(error: std::io::Error) -> std::io::Error {
+    if error.kind() != std::io::ErrorKind::PermissionDenied {
+        return error;
+    }
+    std::io::Error::new(
+        error.kind(),
+        format!(
+            "For an elevated server, use an administrator terminal. Sharing with ordinary \
+             clients requires stopping it there and restarting its `herdr server` command \
+             with --allow-unelevated-clients (closes panes). {error}"
+        ),
+    )
+}
+
+pub(crate) fn windows_virtual_terminal_input_active() -> bool {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, ENABLE_VIRTUAL_TERMINAL_INPUT, STD_INPUT_HANDLE,
+    };
+
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return false;
+    }
+    let mut mode = 0;
+    (unsafe { GetConsoleMode(handle, &mut mode) } != 0) && mode & ENABLE_VIRTUAL_TERMINAL_INPUT != 0
+}
+
+pub(crate) fn classify_child_exit(status: &portable_pty::ExitStatus) -> super::ChildExitReason {
+    // STATUS_CONTROL_C_EXIT is reported without a Unix signal by portable-pty.
+    if status.exit_code() == 0xC000013A {
+        super::ChildExitReason::Interrupted
+    } else {
+        super::ChildExitReason::Exited
+    }
+}
+
+pub(crate) fn host_shutdown_in_progress() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SHUTTINGDOWN};
+
+    // This describes the current Windows session, including logoff. Child exit
+    // codes alone cannot distinguish host shutdown from ordinary process failure.
+    unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) != 0 }
+}
+
+pub(crate) struct RemoteBridgeWake;
+
+impl RemoteBridgeWake {
+    pub(crate) fn new() -> std::io::Result<Self> {
+        Ok(Self)
+    }
+
+    pub(crate) fn cancel(&self) -> std::io::Result<()> {
+        // The named-pipe reader checks its cancellation flag between peeks.
+        Ok(())
+    }
+
+    pub(crate) fn wait(&self, _stream: &crate::ipc::LocalStream) -> std::io::Result<()> {
+        // Synchronous named pipes still use peek-before-read polling on Windows.
+        std::thread::sleep(Duration::from_millis(1));
+        Ok(())
+    }
+}
+
+pub(crate) fn wait_client_stream_readable(
+    _stream: &crate::ipc::LocalStream,
+) -> std::io::Result<()> {
+    // Sync named pipes have no read timeout. The caller peeks before each read and checks its
+    // cancellation flag between polls, including when a frame arrives in several fragments.
+    std::thread::sleep(Duration::from_millis(2));
+    Ok(())
+}
+
+pub(crate) fn forward_remote_bridge_stdio(
+    stream: crate::ipc::LocalStream,
+    _idle_timeout: bool,
+) -> std::io::Result<()> {
+    use interprocess::TryClone as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let mut stdout = std::io::stdout().lock();
+    let mut socket_to_stdout = stream.try_clone()?;
+    let mut stdin_to_socket = stream;
+    let upload_done = Arc::new(AtomicBool::new(false));
+    let upload_done_worker = Arc::clone(&upload_done);
+    let _upload = std::thread::spawn(move || {
+        let mut stdin = std::io::stdin();
+        let _ = copy_flush(&mut stdin, &mut stdin_to_socket);
+        upload_done_worker.store(true, Ordering::Release);
+    });
+
+    let mut buffer = [0_u8; 16 * 1024];
+    while !upload_done.load(Ordering::Acquire) {
+        match crate::ipc::poll_local_stream_read_count(&mut socket_to_stdout, &mut buffer)? {
+            crate::ipc::LocalStreamReadCount::Data(read) => {
+                std::io::Write::write_all(&mut stdout, &buffer[..read])?;
+                std::io::Write::flush(&mut stdout)?;
+            }
+            crate::ipc::LocalStreamReadCount::Pending => {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            crate::ipc::LocalStreamReadCount::Closed => break,
+        }
+    }
+    Ok(())
+}
+
+fn copy_flush<R: std::io::Read, W: std::io::Write>(
+    reader: &mut R,
+    writer: &mut W,
+) -> std::io::Result<()> {
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = match reader.read(&mut buffer) {
+            Ok(0) => return Ok(()),
+            Ok(read) => read,
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        };
+        writer.write_all(&buffer[..read])?;
+        writer.flush()?;
+    }
+}
+
+pub(super) fn read_terminal_grid_size() -> std::io::Result<(u16, u16)> {
+    crossterm::terminal::size()
+}
+
+pub(crate) fn replace_file(
+    source: &std::path::Path,
+    destination: &std::path::Path,
+) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let source = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let destination = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let moved = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if moved == 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+pub(crate) fn config_file_link_count(path: &std::path::Path) -> std::io::Result<u64> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    let file = std::fs::File::open(path)?;
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut info) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(u64::from(info.nNumberOfLinks))
+}
+
+pub(crate) fn create_config_temporary(
+    path: &std::path::Path,
+    private: bool,
+) -> std::io::Result<std::fs::File> {
+    if !private {
+        return std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path);
+    }
+    use interprocess::os::windows::security_descriptor::AsSecurityDescriptorExt as _;
+    use windows_sys::Win32::{
+        Foundation::GENERIC_WRITE,
+        Storage::FileSystem::{
+            CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        },
+    };
+    let descriptor = user_security_descriptor("GA", "")?;
+    let mut attributes = SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: null_mut(),
+        bInheritHandle: 0,
+    };
+    descriptor.write_to_security_attributes(&mut attributes);
+    let path = extended_length_path(path)?;
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // CreateFileW returned an owned handle; File closes it exactly once.
+    Ok(unsafe { std::fs::File::from_raw_handle(handle) })
+}
+
+pub(crate) fn write_config_temporary(
+    source: Option<&std::path::Path>,
+    temporary: &std::path::Path,
+    contents: &[u8],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    if source.is_some() {
+        // If preparation finds an existing file, leave it to the recovery-backed
+        // path instead of applying replacement-file permissions.
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "config appeared while preparing a new file; retry the update",
+        ));
+    }
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(temporary)?;
+    output.write_all(contents)?;
+    output.sync_all()
+}
+
+pub(crate) fn check_config_write_target(target: &std::path::Path) -> std::io::Result<()> {
+    config_backup::check_recovery(target)
+}
+
+pub(crate) fn write_existing_config(
+    target: &std::path::Path,
+    contents: &[u8],
+) -> std::io::Result<bool> {
+    config_backup::write_existing(target, contents)
+}
+
+#[cfg(test)]
+fn config_security_descriptor(
+    path: &std::path::Path,
+    information: windows_sys::Win32::Security::OBJECT_SECURITY_INFORMATION,
+) -> std::io::Result<Vec<u8>> {
+    use windows_sys::Win32::Security::GetFileSecurityW;
+    let path = extended_length_path(path)?;
+    let mut needed = 0;
+    unsafe { GetFileSecurityW(path.as_ptr(), information, null_mut(), 0, &mut needed) };
+    if needed == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut descriptor = vec![0_u8; needed as usize];
+    if unsafe {
+        GetFileSecurityW(
+            path.as_ptr(),
+            information,
+            descriptor.as_mut_ptr().cast(),
+            needed,
+            &mut needed,
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(descriptor)
+}
+
+#[cfg(test)]
+fn config_security_sddl(
+    descriptor: &mut [u8],
+    information: windows_sys::Win32::Security::OBJECT_SECURITY_INFORMATION,
+) -> std::io::Result<Vec<u16>> {
+    use windows_sys::Win32::Security::{
+        Authorization::{ConvertSecurityDescriptorToStringSecurityDescriptorW, SDDL_REVISION_1},
+        SACL_SECURITY_INFORMATION,
+    };
+    let mut text = null_mut();
+    if unsafe {
+        ConvertSecurityDescriptorToStringSecurityDescriptorW(
+            descriptor.as_mut_ptr().cast(),
+            SDDL_REVISION_1,
+            // Only labels were queried from the SACL. Serialize that returned
+            // SACL too; this does not request audit access to either file.
+            information | SACL_SECURITY_INFORMATION,
+            &mut text,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    let result = unsafe { widestring::U16CStr::from_ptr_str(text) }
+        .as_slice()
+        .to_vec();
+    unsafe { LocalFree(text.cast()) };
+    Ok(result)
+}
+
+pub(crate) fn set_default_plugin_pane_pwd(
+    _env: &mut Vec<(String, String)>,
+    _cwd: &std::path::Path,
+) {
+}
+
+#[cfg(target_pointer_width = "64")]
 use windows_sys::{
+    Wdk::System::Threading::ProcessWow64Information, Win32::System::Kernel::STRING32,
+};
+
+use windows_sys::{
+    Wdk::System::Threading::ProcessCommandLineInformation,
     Wdk::System::Threading::{NtQueryInformationProcess, ProcessBasicInformation},
     Win32::{
         Foundation::{
             CloseHandle, GlobalFree, LocalFree, FILETIME, HANDLE, HWND, INVALID_HANDLE_VALUE,
-            NTSTATUS, STATUS_SUCCESS, UNICODE_STRING,
+            MAX_PATH, NTSTATUS, STATUS_BUFFER_OVERFLOW, STATUS_BUFFER_TOO_SMALL,
+            STATUS_INFO_LENGTH_MISMATCH, STATUS_SUCCESS, UNICODE_STRING,
         },
         Globalization::{CompareStringOrdinal, CSTR_EQUAL, CSTR_GREATER_THAN, CSTR_LESS_THAN},
+        Security::SECURITY_ATTRIBUTES,
+        Storage::FileSystem::CreateDirectoryW,
         System::{
             Console::GetConsoleWindow,
-            DataExchange::{CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData},
+            DataExchange::{
+                CloseClipboard, CountClipboardFormats, EmptyClipboard, EnumClipboardFormats,
+                GetClipboardData, GetClipboardOwner, GetClipboardSequenceNumber, OpenClipboard,
+                RegisterClipboardFormatW, SetClipboardData,
+            },
             Diagnostics::{
                 Debug::ReadProcessMemory,
                 ToolHelp::{
-                    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
-                    TH32CS_SNAPPROCESS,
+                    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, Thread32First,
+                    Thread32Next, PROCESSENTRY32W, TH32CS_SNAPPROCESS, TH32CS_SNAPTHREAD,
+                    THREADENTRY32,
                 },
             },
             JobObjects::{
-                IsProcessInJob, JobObjectExtendedLimitInformation, QueryInformationJobObject,
-                JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+                AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob,
+                JobObjectExtendedLimitInformation, QueryInformationJobObject,
+                SetInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+                JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             },
             Memory::{
-                GlobalAlloc, GlobalLock, GlobalUnlock, VirtualQueryEx, GMEM_MOVEABLE,
+                GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock, VirtualQueryEx, GMEM_MOVEABLE,
                 MEMORY_BASIC_INFORMATION,
             },
-            Ole::CF_UNICODETEXT,
+            Ole::{CF_DIB, CF_DIBV5, CF_LOCALE, CF_OEMTEXT, CF_TEXT, CF_UNICODETEXT},
             Threading::{
-                GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, OpenProcess,
-                QueryFullProcessImageNameW, TerminateProcess, CREATE_NO_WINDOW, DETACHED_PROCESS,
+                GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, IsWow64Process2,
+                OpenProcess, OpenThread, QueryFullProcessImageNameW, ResumeThread,
+                TerminateProcess, CREATE_NO_WINDOW, CREATE_SUSPENDED, DETACHED_PROCESS,
                 PROCESS_BASIC_INFORMATION, PROCESS_QUERY_INFORMATION,
-                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+                PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ, THREAD_SUSPEND_RESUME,
             },
         },
         UI::{
             Input::{
                 Ime::ImmGetDefaultIMEWnd,
                 KeyboardAndMouse::{
-                    GetKeyboardLayout, SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-                    KEYEVENTF_KEYUP,
+                    GetKeyboardLayout, SendInput, ToUnicodeEx, INPUT, INPUT_0, INPUT_KEYBOARD,
+                    KEYBDINPUT, KEYEVENTF_KEYUP,
                 },
             },
-            Shell::{
-                CommandLineToArgvW, ShellExecuteW, Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_TIP,
-                NIIF_INFO, NIIF_NOSOUND, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
-            },
+            Shell::{CommandLineToArgvW, ShellExecuteW},
             WindowsAndMessaging::{
-                CreateWindowExW, DestroyWindow, GetForegroundWindow, GetWindowThreadProcessId,
-                LoadIconW, SendMessageTimeoutW, IDI_APPLICATION, SMTO_ABORTIFHUNG, WM_IME_CONTROL,
+                GetForegroundWindow, GetWindowThreadProcessId, SendMessageTimeoutW,
+                SMTO_ABORTIFHUNG, WM_IME_CONTROL,
             },
         },
     },
@@ -70,7 +518,180 @@ use super::{ClipboardImage, ForegroundJob, Signal};
 
 const STILL_ACTIVE: u32 = 259;
 const FOREGROUND_PROCESS_SNAPSHOT_CACHE_TTL: Duration = Duration::from_millis(250);
+const FOREGROUND_SELECTION_RECHECK: Duration = Duration::from_secs(5);
+const FOREGROUND_SELECTION_CACHE_CAPACITY: usize = 1_024;
+const FOREGROUND_SELECTION_CACHE_RETENTION: Duration = Duration::from_secs(60);
 const PANE_RUNTIME_MARKER_ENV_VAR: &str = "HERDR_PANE_RUNTIME_ID";
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct ProcessInspectionCounts {
+    snapshots: u64,
+    opens: u64,
+    command_reads: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PROCESS_INSPECTION_COUNTS: std::cell::RefCell<ProcessInspectionCounts> =
+        std::cell::RefCell::new(ProcessInspectionCounts::default());
+}
+
+/// Native processor architecture of the Windows host as an
+/// `IMAGE_FILE_MACHINE_*` value. `IsWow64Process2` reports the native machine
+/// even when an x64 Herdr runs under emulation on Windows ARM64, which the
+/// build target alone cannot reveal.
+pub(crate) fn native_machine_type() -> u16 {
+    let mut process_machine = 0u16;
+    let mut native_machine = 0u16;
+    // SAFETY: `GetCurrentProcess` returns a pseudo-handle and both out-pointers
+    // are valid for the duration of the call.
+    let ok = unsafe {
+        IsWow64Process2(
+            GetCurrentProcess(),
+            &mut process_machine,
+            &mut native_machine,
+        )
+    };
+    if ok != 0 && native_machine != 0 {
+        native_machine
+    } else {
+        process_machine
+    }
+}
+
+pub(crate) fn terminal_title_for_presentation(title: &str) -> &str {
+    title.strip_prefix("Administrator: ").unwrap_or(title)
+}
+
+pub(crate) fn prepare_paste_text_for_pty_platform(text: String) -> String {
+    text.replace("\r\n", "\n").replace('\n', "\r\n")
+}
+
+pub(crate) fn normalize_cwd_for_launch_platform(path: &std::path::Path) -> PathBuf {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Component, Prefix};
+    use windows_sys::Win32::{
+        Foundation::INVALID_HANDLE_VALUE,
+        Storage::FileSystem::{FindClose, FindFirstFileW, WIN32_FIND_DATAW},
+    };
+
+    fn stored_name(path: &std::path::Path) -> Option<std::ffi::OsString> {
+        let input = path
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect::<Vec<_>>();
+        let mut data = std::mem::MaybeUninit::<WIN32_FIND_DATAW>::uninit();
+        let handle = unsafe { FindFirstFileW(input.as_ptr(), data.as_mut_ptr()) };
+        if handle == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let data = unsafe { data.assume_init() };
+        unsafe { FindClose(handle) };
+        let len = data
+            .cFileName
+            .iter()
+            .position(|&ch| ch == 0)
+            .unwrap_or(data.cFileName.len());
+        Some(std::ffi::OsString::from_wide(&data.cFileName[..len]))
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => match prefix.kind() {
+                Prefix::Disk(drive) => {
+                    normalized.push(format!("{}:", char::from(drive).to_ascii_uppercase()))
+                }
+                _ => normalized.push(prefix.as_os_str()),
+            },
+            Component::Normal(name) => {
+                let candidate = normalized.join(name);
+                normalized.push(stored_name(&candidate).unwrap_or_else(|| name.to_os_string()));
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
+}
+
+pub(crate) fn plugin_runtime_path_platform(path: &std::path::Path) -> PathBuf {
+    use std::os::windows::ffi::OsStrExt;
+
+    let Some(candidate) = standard_windows_path(path) else {
+        return path.to_path_buf();
+    };
+    // Rust can canonicalize a long standard path by adding its own verbatim prefix, but native
+    // process consumers still need the original prefix when the plugin root exceeds MAX_PATH.
+    if candidate.join("").as_os_str().encode_wide().count() >= MAX_PATH as usize {
+        return path.to_path_buf();
+    }
+    match candidate.canonicalize() {
+        Ok(canonical) if canonical == path => candidate,
+        _ => path.to_path_buf(),
+    }
+}
+
+fn standard_windows_path(path: &std::path::Path) -> Option<PathBuf> {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    let Component::Prefix(prefix) = components.next()? else {
+        return None;
+    };
+    let mut candidate = match prefix.kind() {
+        Prefix::VerbatimDisk(drive) => PathBuf::from(format!("{}:", char::from(drive))),
+        Prefix::VerbatimUNC(server, share) => {
+            let mut candidate = PathBuf::from(r"\\");
+            candidate.push(server);
+            candidate.push(share);
+            candidate
+        }
+        _ => return None,
+    };
+    candidate.push(components.as_path());
+    Some(candidate)
+}
+
+/// Resolves against the current foreground layout because asynchronous console
+/// records do not retain the layout that was active when the key was pressed.
+pub(crate) fn resolve_base_printable_key(vk: u16, scan: u16) -> Option<char> {
+    // SAFETY: the foreground window and its layout are owned by Win32.
+    let layout = unsafe {
+        let thread_id = GetWindowThreadProcessId(GetForegroundWindow(), null_mut());
+        GetKeyboardLayout(thread_id)
+    };
+    resolve_base_printable_key_in_layout(vk, scan, layout)
+}
+
+pub(crate) fn resolve_base_printable_key_in_layout(
+    vk: u16,
+    scan: u16,
+    layout: windows_sys::Win32::UI::Input::KeyboardAndMouse::HKL,
+) -> Option<char> {
+    // SAFETY: Win32 owns the handles; the fixed buffers match the API lengths.
+    unsafe {
+        let key_state = [0u8; 256];
+        let mut output = [0u16; 2];
+        let written = ToUnicodeEx(
+            vk.into(),
+            scan.into(),
+            key_state.as_ptr(),
+            output.as_mut_ptr(),
+            output.len() as i32,
+            0x4,
+            layout,
+        );
+        // A negative result identifies a dead key; its spacing accent is still
+        // the key's identity. Flag 0x4 above keeps composition state unchanged.
+        let units = output.get(..usize::try_from(written.unsigned_abs()).ok()?)?;
+        let mut chars = char::decode_utf16(units.iter().copied());
+        let ch = chars.next()?.ok()?;
+        (chars.next().is_none() && !ch.is_control()).then_some(ch)
+    }
+}
+
 const MAX_PROCESS_ENVIRONMENT_BYTES: usize = 256 * 1024;
 const PROCESS_ENVIRONMENT_READ_CHUNK_BYTES: usize = 16 * 1024;
 const PROCESS_RUNTIME_MARKER_CACHE_CAPACITY: usize = 1_024;
@@ -82,6 +703,111 @@ static PROCESS_RUNTIME_MARKER_CACHE: LazyLock<Mutex<HashMap<u32, CachedProcessRu
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static GIT_BASH_PROCESS_CACHE: LazyLock<Mutex<HashMap<u32, CachedGitBashProcess>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(crate) fn remote_ssh_config_paths() -> super::RemoteSshConfigPaths {
+    super::RemoteSshConfigPaths {
+        user_config: std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .map(|home| home.join(".ssh").join("config")),
+        system_config: std::env::var_os("PROGRAMDATA")
+            .map(PathBuf::from)
+            .map(|dir| dir.join("ssh").join("ssh_config")),
+        multiplexing: false,
+    }
+}
+
+pub(crate) fn create_remote_ssh_config_dir(_control_socket_name: &str) -> std::io::Result<PathBuf> {
+    let base = remote_private_temp_base();
+    std::fs::create_dir_all(&base)?;
+    for attempt in 0..100 {
+        let dir = base.join(format!("ssh-{}-{attempt}", std::process::id()));
+        match create_remote_private_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "failed to create private herdr ssh config directory",
+    ))
+}
+
+pub(crate) fn create_remote_ssh_config_file(
+    path: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+pub(crate) fn create_remote_private_dir(path: &std::path::Path) -> std::io::Result<()> {
+    use interprocess::os::windows::security_descriptor::{
+        AsSecurityDescriptorExt as _, SecurityDescriptor,
+    };
+    use widestring::U16CString;
+
+    let sddl = U16CString::from_str("D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;OW)")
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
+    let security_descriptor = SecurityDescriptor::deserialize(&sddl)?;
+    let mut security_attributes = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(u32::MAX),
+        lpSecurityDescriptor: null_mut(),
+        bInheritHandle: 0,
+    };
+    security_descriptor.write_to_security_attributes(&mut security_attributes);
+    let path = extended_length_path(path)?;
+    if unsafe { CreateDirectoryW(path.as_ptr(), &security_attributes) } != 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn extended_length_path(path: &std::path::Path) -> std::io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let path = std::path::absolute(path)?;
+    let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    let mut extended = if wide.starts_with(&[b'\\' as u16, b'\\' as u16, b'?' as u16, b'\\' as u16])
+        || wide.starts_with(&[b'\\' as u16, b'\\' as u16, b'.' as u16, b'\\' as u16])
+    {
+        wide
+    } else if wide.starts_with(&[b'\\' as u16, b'\\' as u16]) {
+        "\\\\?\\UNC\\"
+            .encode_utf16()
+            .chain(wide.into_iter().skip(2))
+            .collect()
+    } else {
+        "\\\\?\\".encode_utf16().chain(wide).collect()
+    };
+    extended.push(0);
+    Ok(extended)
+}
+
+pub(crate) fn remote_private_temp_base() -> PathBuf {
+    crate::config::state_dir().join("remote")
+}
+
+pub(crate) fn remote_bridge_endpoint_path(_readable_name: &str, short_name: &str) -> PathBuf {
+    remote_private_temp_base().join(short_name)
+}
+
+pub(crate) fn remote_reattach_program(program: &str) -> String {
+    let path = std::env::current_exe()
+        .ok()
+        .filter(|path| path.is_absolute())
+        .unwrap_or_else(|| PathBuf::from(program));
+    format!(
+        "& {}",
+        remote_reattach_argument(&path.display().to_string())
+    )
+}
+
+pub(crate) fn remote_reattach_argument(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
 
 /// Encode native or targeted semantic Win32 input for a compatible ConPTY destination.
 pub(crate) fn encode_windows_conpty_fallback(key: &crate::input::TerminalKey) -> Option<Vec<u8>> {
@@ -121,12 +847,98 @@ pub(crate) fn encode_windows_conpty_fallback(key: &crate::input::TerminalKey) ->
 #[derive(Debug)]
 struct CachedProcessSnapshot {
     built_at: Instant,
-    entries: Arc<Vec<WindowsProcessEntry>>,
+    snapshot: Arc<ProcessSnapshot>,
 }
 
 #[derive(Debug)]
 struct ProcessSnapshotCache {
     cached: Option<CachedProcessSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessSignature {
+    pid: u32,
+    parent_pid: u32,
+    name: String,
+}
+
+impl ProcessSignature {
+    fn from_entry(entry: &WindowsProcessEntry) -> Self {
+        Self {
+            pid: entry.pid,
+            parent_pid: entry.parent_pid,
+            name: entry.name.clone(),
+        }
+    }
+
+    fn matches(&self, entry: Option<&WindowsProcessEntry>) -> bool {
+        entry.is_some_and(|entry| {
+            self.pid == entry.pid && self.parent_pid == entry.parent_pid && self.name == entry.name
+        })
+    }
+}
+
+#[derive(Debug)]
+enum ProcessIdentity {
+    Handle(OwnedHandle),
+    #[cfg(test)]
+    Stub {
+        running: bool,
+        creation_time: Option<u64>,
+    },
+}
+
+impl ProcessIdentity {
+    fn open(pid: u32) -> Option<Self> {
+        #[cfg(test)]
+        PROCESS_INSPECTION_COUNTS.with_borrow_mut(|counts| counts.opens += 1);
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return None;
+        }
+        let handle = unsafe { OwnedHandle::from_raw_handle(handle.cast()) };
+        Some(Self::Handle(handle))
+    }
+
+    fn running(&self) -> bool {
+        match self {
+            Self::Handle(handle) => {
+                let mut exit_code = 0;
+                let read = unsafe {
+                    GetExitCodeProcess(handle.as_raw_handle().cast(), &mut exit_code) != 0
+                };
+                read && exit_code == STILL_ACTIVE
+            }
+            #[cfg(test)]
+            Self::Stub { running, .. } => *running,
+        }
+    }
+
+    fn creation_time(&self) -> Option<u64> {
+        match self {
+            Self::Handle(handle) => process_creation_time(handle.as_raw_handle().cast()),
+            #[cfg(test)]
+            Self::Stub { creation_time, .. } => *creation_time,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CachedForegroundSelection {
+    shell: ProcessSignature,
+    selected: ProcessSignature,
+    descendants: Vec<ProcessSignature>,
+    descendant_identities: Vec<ProcessIdentity>,
+    shell_identity: ProcessIdentity,
+    selected_identity: ProcessIdentity,
+    job: ForegroundJob,
+    verified_at: Instant,
+    last_used: Instant,
+}
+
+#[derive(Debug, Default)]
+struct ForegroundSelectionCache {
+    entries: HashMap<u32, CachedForegroundSelection>,
 }
 
 #[derive(Debug)]
@@ -146,19 +958,123 @@ struct CachedGitBashProcess {
 
 static FOREGROUND_PROCESS_SNAPSHOT_CACHE: Mutex<ProcessSnapshotCache> =
     Mutex::new(ProcessSnapshotCache { cached: None });
+static FOREGROUND_SELECTION_CACHE: LazyLock<Mutex<ForegroundSelectionCache>> =
+    LazyLock::new(|| Mutex::new(ForegroundSelectionCache::default()));
 
 pub(crate) fn should_draw_host_cursor_by_default() -> bool {
     true
 }
 
+pub(crate) fn should_query_host_terminal_palette() -> bool {
+    false
+}
+
+/// The machine's node name, as shown by tmux's `#h`.
+pub(crate) fn hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME")
+        .ok()
+        .filter(|name| !name.is_empty())
+}
+
+pub(crate) fn local_datetime() -> Option<time::PrimitiveDateTime> {
+    let mut timestamp: libc::time_t = 0;
+    if unsafe { libc::time(&mut timestamp) } == -1 {
+        return None;
+    }
+    let mut local: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_s(&mut local, &timestamp) } != 0 {
+        return None;
+    }
+    let month = time::Month::try_from(u8::try_from(local.tm_mon + 1).ok()?).ok()?;
+    let date = time::Date::from_calendar_date(
+        local.tm_year + 1900,
+        month,
+        u8::try_from(local.tm_mday).ok()?,
+    )
+    .ok()?;
+    let time = time::Time::from_hms(
+        u8::try_from(local.tm_hour).ok()?,
+        u8::try_from(local.tm_min).ok()?,
+        u8::try_from(local.tm_sec).ok()?,
+    )
+    .ok()?;
+    Some(time::PrimitiveDateTime::new(date, time))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowsProcessCommand {
+    creation_time: Option<u64>,
+    argv0: Option<String>,
+    argv: Option<Vec<String>>,
+    cmdline: Option<String>,
+}
+
+#[derive(Debug, Clone)]
 struct WindowsProcessEntry {
     pid: u32,
     parent_pid: u32,
     name: String,
-    argv0: Option<String>,
-    argv: Option<Vec<String>>,
-    cmdline: Option<String>,
+    command: OnceLock<WindowsProcessCommand>,
+}
+
+impl WindowsProcessEntry {
+    fn command(&self) -> &WindowsProcessCommand {
+        self.command
+            .get_or_init(|| read_process_command(self.pid, &self.name))
+    }
+}
+
+#[derive(Debug)]
+struct ProcessSnapshot {
+    entries: Vec<WindowsProcessEntry>,
+    entry_by_pid: HashMap<u32, usize>,
+    children_by_parent: HashMap<u32, Vec<usize>>,
+    agent_indices: OnceLock<Vec<usize>>,
+}
+
+impl ProcessSnapshot {
+    fn new(entries: Vec<WindowsProcessEntry>) -> Self {
+        let mut entry_by_pid = HashMap::with_capacity(entries.len());
+        let mut children_by_parent = HashMap::<u32, Vec<usize>>::new();
+        for (index, entry) in entries.iter().enumerate() {
+            entry_by_pid.insert(entry.pid, index);
+            children_by_parent
+                .entry(entry.parent_pid)
+                .or_default()
+                .push(index);
+        }
+        Self {
+            entries,
+            entry_by_pid,
+            children_by_parent,
+            agent_indices: OnceLock::new(),
+        }
+    }
+
+    fn entry(&self, pid: u32) -> Option<&WindowsProcessEntry> {
+        self.entry_by_pid
+            .get(&pid)
+            .map(|&index| &self.entries[index])
+    }
+
+    fn descendant_signatures(&self, root_pid: u32) -> Vec<ProcessSignature> {
+        let mut signatures = descendant_entries(root_pid, self)
+            .into_iter()
+            .map(ProcessSignature::from_entry)
+            .collect::<Vec<_>>();
+        signatures.sort_unstable_by_key(|entry| entry.pid);
+        signatures
+    }
+
+    fn agent_indices(&self) -> &[usize] {
+        self.agent_indices.get_or_init(|| {
+            self.entries
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| process_entry_identifies_agent(entry).then_some(index))
+                .collect()
+        })
+    }
 }
 
 pub fn raise_server_nofile_limit() {}
@@ -201,45 +1117,24 @@ fn powershell_agent_script(argv: &[String]) -> Option<String> {
         return Some(format!("& {}", super::quote_powershell_arg(program)));
     }
 
+    let powershell_args = args
+        .iter()
+        .map(|arg| super::quote_powershell_arg(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
     let command_line = args
         .iter()
-        .map(|arg| quote_windows_command_line_arg(arg))
+        .map(|arg| super::quote_windows_command_line_arg(arg))
         .collect::<Vec<_>>()
         .join(" ");
     Some(format!(
-        "$p=Start-Process -FilePath {} -ArgumentList {} -NoNewWindow -Wait -PassThru",
+        "if((Get-Command {} -ErrorAction SilentlyContinue).CommandType -eq 'ExternalScript'){{& {} {}}}else{{Start-Process -FilePath {} -ArgumentList {} -NoNewWindow -Wait}}",
+        super::quote_powershell_arg(program),
+        super::quote_powershell_arg(program),
+        powershell_args,
         super::quote_powershell_arg(program),
         super::quote_powershell_arg(&command_line),
     ))
-}
-
-fn quote_windows_command_line_arg(value: &str) -> String {
-    if !value.is_empty()
-        && !value
-            .chars()
-            .any(|ch| matches!(ch, ' ' | '\t' | '\n' | '\x0b' | '"'))
-    {
-        return value.to_string();
-    }
-
-    let mut quoted = String::from("\"");
-    let mut backslashes = 0;
-    for ch in value.chars() {
-        if ch == '\\' {
-            backslashes += 1;
-            continue;
-        }
-        if ch == '"' {
-            quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
-        } else {
-            quoted.push_str(&"\\".repeat(backslashes));
-        }
-        backslashes = 0;
-        quoted.push(ch);
-    }
-    quoted.push_str(&"\\".repeat(backslashes * 2));
-    quoted.push('"');
-    quoted
 }
 
 fn cmd_encoded_powershell_command(script: &str) -> String {
@@ -255,6 +1150,146 @@ fn cmd_encoded_powershell_command(script: &str) -> String {
 
 pub(crate) fn detached_custom_command_process_platform(command: &str) -> std::process::Command {
     detached_custom_command_process_with_comspec(command, std::env::var_os("ComSpec"))
+}
+
+pub(crate) fn status_commands_supported() -> bool {
+    true
+}
+
+pub(crate) fn configure_status_command(process: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+
+    // The process must not run before it is assigned to the kill-on-close job.
+    process.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
+}
+
+pub(crate) struct StatusCommandGuard {
+    job: usize,
+}
+
+impl StatusCommandGuard {
+    pub(crate) fn new(child: &tokio::process::Child) -> std::io::Result<Self> {
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let limits_size = match u32::try_from(size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>()) {
+            Ok(size) => size,
+            Err(_) => {
+                unsafe {
+                    CloseHandle(job);
+                }
+                return Err(std::io::Error::other("job limits size exceeds u32"));
+            }
+        };
+        if unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                std::ptr::from_ref(&limits).cast(),
+                limits_size,
+            )
+        } == 0
+        {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                CloseHandle(job);
+            }
+            return Err(error);
+        }
+
+        let Some(process) = child.raw_handle() else {
+            unsafe {
+                CloseHandle(job);
+            }
+            return Err(std::io::Error::other(
+                "status command has no process handle",
+            ));
+        };
+        if unsafe { AssignProcessToJobObject(job, process.cast()) } == 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe {
+                CloseHandle(job);
+            }
+            return Err(error);
+        }
+        if let Err(error) = resume_suspended_process(child.id()) {
+            unsafe {
+                CloseHandle(job);
+            }
+            return Err(error);
+        }
+
+        Ok(Self { job: job as usize })
+    }
+}
+
+fn resume_suspended_process(process_id: Option<u32>) -> std::io::Result<()> {
+    let process_id =
+        process_id.ok_or_else(|| std::io::Error::other("status command has no process id"))?;
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let result = (|| {
+        let mut entry: THREADENTRY32 = unsafe { std::mem::zeroed() };
+        entry.dwSize = u32::try_from(size_of::<THREADENTRY32>())
+            .map_err(|_| std::io::Error::other("thread entry size exceeds u32"))?;
+        if unsafe { Thread32First(snapshot, &mut entry) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        loop {
+            if entry.th32OwnerProcessID == process_id {
+                let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID) };
+                if thread.is_null() {
+                    return Err(std::io::Error::last_os_error());
+                }
+                let resume_result = unsafe { ResumeThread(thread) };
+                let resume_error = (resume_result == u32::MAX).then(std::io::Error::last_os_error);
+                unsafe {
+                    CloseHandle(thread);
+                }
+                if let Some(error) = resume_error {
+                    return Err(error);
+                }
+                return Ok(());
+            }
+            if unsafe { Thread32Next(snapshot, &mut entry) } == 0 {
+                return Err(std::io::Error::other(
+                    "status command primary thread was not found",
+                ));
+            }
+        }
+    })();
+
+    unsafe {
+        CloseHandle(snapshot);
+    }
+    result
+}
+
+impl StatusCommandGuard {
+    pub(crate) fn terminate(&mut self) {
+        if self.job != 0 {
+            // KILL_ON_JOB_CLOSE terminates the shell and every descendant still in
+            // the job, including on task cancellation and config reload.
+            unsafe {
+                CloseHandle(self.job as HANDLE);
+            }
+            self.job = 0;
+        }
+    }
+}
+
+impl Drop for StatusCommandGuard {
+    fn drop(&mut self) {
+        self.terminate();
+    }
 }
 
 fn detached_custom_command_process_with_comspec(
@@ -406,7 +1441,7 @@ fn windows_command_line(command: &std::process::Command) -> std::io::Result<Stri
         .chain(command.get_args())
         .map(|value| {
             unicode_windows_value(value, "server command argument")
-                .map(|value| quote_windows_command_line_arg(&value))
+                .map(|value| super::quote_windows_command_line_arg(&value))
         })
         .collect::<std::io::Result<Vec<_>>>()
         .map(|parts| parts.join(" "))
@@ -509,34 +1544,35 @@ pub fn current_process_is_detached_server_daemon() -> bool {
         return false;
     }
 
-    matches!(current_process_is_in_job(), Ok(false))
+    // Job membership alone does not tie the daemon lifetime to its launcher.
+    matches!(current_job_kills_processes_on_close(), Ok(false))
 }
 
 pub fn foreground_job(child_pid: u32) -> Option<ForegroundJob> {
-    let entries = snapshot_processes();
-    select_pane_foreground_job(child_pid, &entries)
+    select_pane_foreground_job_cached(child_pid)
 }
 
 pub(crate) fn available_pane_shell(child_pid: u32) -> Option<String> {
-    available_pane_shell_from_snapshot(child_pid, &snapshot_processes())
+    let snapshot = ProcessSnapshot::new(snapshot_processes());
+    available_pane_shell_from_snapshot(child_pid, &snapshot)
 }
 
 fn available_pane_shell_from_snapshot(
     child_pid: u32,
-    entries: &[WindowsProcessEntry],
+    snapshot: &ProcessSnapshot,
 ) -> Option<String> {
-    let shell = entries.iter().find(|entry| entry.pid == child_pid)?;
+    let shell = snapshot.entry(child_pid)?;
     if !super::is_pane_shell_process_name(&shell.name) {
         return None;
     }
-    descendant_entries(child_pid, entries)
+    descendant_entries(child_pid, snapshot)
         .is_empty()
         .then(|| shell.name.clone())
 }
 
 pub fn foreground_group_leader_job(process_group_id: u32) -> Option<ForegroundJob> {
-    let entries = cached_foreground_processes();
-    let entry = entries.iter().find(|entry| entry.pid == process_group_id)?;
+    let snapshot = cached_foreground_processes();
+    let entry = snapshot.entry(process_group_id)?;
     Some(ForegroundJob {
         process_group_id,
         processes: vec![foreground_process_from_entry(entry)],
@@ -544,38 +1580,140 @@ pub fn foreground_group_leader_job(process_group_id: u32) -> Option<ForegroundJo
 }
 
 pub fn foreground_process_group_id(child_pid: u32) -> Option<u32> {
-    let entries = cached_foreground_processes();
-    select_pane_foreground_job(child_pid, &entries).map(|job| job.process_group_id)
+    select_pane_foreground_job_cached(child_pid).map(|job| job.process_group_id)
 }
 
 pub fn process_cwd(pid: u32) -> Option<PathBuf> {
     let process = ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ)?;
-    let process_parameters = read_process_parameters(process.0)?;
-    read_unicode_string(process.0, process_parameters.current_directory.dos_path)
+    process_cwd_from_handle(process.0)
+}
+
+pub(crate) fn pane_process_cwd(child_pid: u32) -> Option<PathBuf> {
+    let process = ProcessHandle::open(
+        child_pid,
+        PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+    )?;
+    let executable = PathBuf::from(process_executable_path(process.0)?);
+    if executable.with_extension("shim").is_file() {
+        // A Scoop shim keeps its launch cwd while the real shell can change directories.
+        // Never replace the saved shell directory with that launcher directory on exit.
+        let snapshot = cached_foreground_processes();
+        return process_cwd(shim_shell_pid(child_pid, &snapshot)?);
+    }
+    process_cwd_from_handle(process.0)
+}
+
+fn process_cwd_from_handle(process: HANDLE) -> Option<PathBuf> {
+    read_unicode_string(process, process_cwd_descriptor(process)?)
         .map(PathBuf::from)
         .filter(|path| path.is_absolute())
 }
 
-fn select_pane_foreground_job(
+fn process_cwd_descriptor(process: HANDLE) -> Option<UNICODE_STRING> {
+    #[cfg(target_pointer_width = "64")]
+    {
+        let mut peb32_address = 0_usize;
+        // SAFETY: the output is a writable ULONG_PTR with its exact buffer size.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                process,
+                ProcessWow64Information,
+                (&mut peb32_address as *mut usize).cast(),
+                size_of::<usize>() as u32,
+                null_mut(),
+            )
+        };
+        if status != STATUS_SUCCESS as NTSTATUS {
+            return None;
+        }
+        if peb32_address != 0 {
+            // WoW64's native PEB can report C:\Windows while the x86 shell uses
+            // another directory. Read its own pointer-width layout instead.
+            let peb = read_process_value::<Peb32>(process, peb32_address as *const c_void)?;
+            let parameters = read_process_value::<ProcessCwdParameters32>(
+                process,
+                peb.process_parameters as usize as *const c_void,
+            )?;
+            let cwd = parameters.current_directory;
+            return Some(UNICODE_STRING {
+                Length: cwd.Length,
+                MaximumLength: cwd.MaximumLength,
+                Buffer: cwd.Buffer as usize as *mut u16,
+            });
+        }
+    }
+    Some(read_process_parameters(process)?.current_directory.dos_path)
+}
+
+fn shim_shell_pid(child_pid: u32, snapshot: &ProcessSnapshot) -> Option<u32> {
+    snapshot.entry(child_pid)?;
+    let mut shells = snapshot
+        .children_by_parent
+        .get(&child_pid)?
+        .iter()
+        .filter_map(|&index| {
+            let entry = &snapshot.entries[index];
+            super::is_pane_shell_process_name(&entry.name).then_some(entry.pid)
+        });
+    let shell_pid = shells.next()?;
+    shells.next().is_none().then_some(shell_pid)
+}
+
+fn select_pane_foreground_job_cached(shell_pid: u32) -> Option<ForegroundJob> {
+    let snapshot = cached_foreground_processes();
+    let (job, retry_with_fresh_snapshot) =
+        select_pane_foreground_job_from_snapshot(shell_pid, &snapshot)?;
+    if !retry_with_fresh_snapshot {
+        return Some(job);
+    }
+
+    let snapshot = fresh_foreground_processes();
+    select_pane_foreground_job_from_snapshot(shell_pid, &snapshot).map(|(job, _)| job)
+}
+
+fn select_pane_foreground_job_from_snapshot(
     shell_pid: u32,
-    entries: &[WindowsProcessEntry],
+    snapshot: &ProcessSnapshot,
+) -> Option<(ForegroundJob, bool)> {
+    if let Some(job) = FOREGROUND_SELECTION_CACHE
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .get(shell_pid, snapshot)
+    {
+        return Some((job, false));
+    }
+
+    let job = select_pane_foreground_job_from_snapshot_uncached(shell_pid, snapshot)?;
+    let cached = prepare_cached_foreground_selection(shell_pid, snapshot, &job);
+    let retry_with_fresh_snapshot = job.process_group_id != shell_pid && cached.is_none();
+    FOREGROUND_SELECTION_CACHE
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .remember(shell_pid, cached);
+    Some((job, retry_with_fresh_snapshot))
+}
+
+fn select_pane_foreground_job_from_snapshot_uncached(
+    shell_pid: u32,
+    snapshot: &ProcessSnapshot,
 ) -> Option<ForegroundJob> {
-    select_pane_foreground_job_with_runtime_inspection(
+    select_pane_foreground_job_from_snapshot_with_runtime_inspection(
         shell_pid,
-        entries,
+        snapshot,
         |shell| process_is_git_bash(shell.pid),
         |entry| process_runtime_marker(entry.pid),
     )
 }
 
-fn select_pane_foreground_job_with_runtime_inspection(
+fn select_pane_foreground_job_from_snapshot_with_runtime_inspection(
     shell_pid: u32,
-    entries: &[WindowsProcessEntry],
+    snapshot: &ProcessSnapshot,
     shell_is_git_bash: impl FnOnce(&WindowsProcessEntry) -> bool,
     mut runtime_marker: impl FnMut(&WindowsProcessEntry) -> Option<String>,
 ) -> Option<ForegroundJob> {
-    let shell = entries.iter().find(|entry| entry.pid == shell_pid)?;
-    let descendants = descendant_entries(shell_pid, entries);
+    let entries = &snapshot.entries;
+    let shell = snapshot.entry(shell_pid)?;
+    let descendants = descendant_entries(shell_pid, snapshot);
     let mut candidates = Vec::new();
     for entry in std::iter::once(shell).chain(descendants) {
         if process_entry_identifies_agent(entry) {
@@ -583,36 +1721,110 @@ fn select_pane_foreground_job_with_runtime_inspection(
         }
     }
 
-    if let Some(selected) = select_topmost_agent_chain_candidate(&candidates, entries) {
+    if let Some(selected) = select_topmost_agent_chain_candidate(&candidates, snapshot) {
         return Some(foreground_job_from_entry(selected));
     }
     if !candidates.is_empty() || !shell_is_git_bash(shell) {
         return Some(foreground_job_from_entry(shell));
     }
 
-    let escaped_candidates: Vec<_> = entries
-        .iter()
-        .filter(|entry| process_entry_identifies_agent(entry))
-        .collect();
-    if escaped_candidates.is_empty() {
+    let escaped_agent_indices = snapshot.agent_indices();
+    if escaped_agent_indices.is_empty() {
         return Some(foreground_job_from_entry(shell));
     }
 
-    let Some(shell_runtime_marker) = runtime_marker(shell).filter(|marker| !marker.is_empty())
-    else {
+    let Some(shell_runtime_marker) = pane_runtime_marker(shell, &mut runtime_marker) else {
         return Some(foreground_job_from_entry(shell));
     };
-    let matching_candidates: Vec<_> = escaped_candidates
-        .into_iter()
-        .filter(|entry| runtime_marker(entry).as_deref() == Some(shell_runtime_marker.as_str()))
+    let matching_candidates: Vec<_> = escaped_agent_indices
+        .iter()
+        .map(|&index| &entries[index])
+        .filter(|entry| {
+            carries_pane_runtime_marker(entry, &shell_runtime_marker, &mut runtime_marker)
+        })
         .collect();
     let selected =
-        select_topmost_agent_chain_candidate(&matching_candidates, entries).unwrap_or(shell);
+        select_topmost_agent_chain_candidate(&matching_candidates, snapshot).unwrap_or(shell);
     Some(foreground_job_from_entry(selected))
 }
 
+#[cfg(test)]
+fn select_pane_foreground_job(
+    shell_pid: u32,
+    entries: &[WindowsProcessEntry],
+) -> Option<ForegroundJob> {
+    select_pane_foreground_job_from_snapshot_uncached(
+        shell_pid,
+        &ProcessSnapshot::new(entries.to_vec()),
+    )
+}
+
+/// Git Bash can start agents outside the pane shell's process tree. Those
+/// belong to the pane when they carry the runtime marker the shell got.
+fn pane_runtime_marker(
+    shell: &WindowsProcessEntry,
+    runtime_marker: &mut impl FnMut(&WindowsProcessEntry) -> Option<String>,
+) -> Option<String> {
+    runtime_marker(shell).filter(|marker| !marker.is_empty())
+}
+
+fn carries_pane_runtime_marker(
+    entry: &WindowsProcessEntry,
+    pane_marker: &str,
+    runtime_marker: &mut impl FnMut(&WindowsProcessEntry) -> Option<String>,
+) -> bool {
+    runtime_marker(entry).as_deref() == Some(pane_marker)
+}
+
+/// Whether foreground selection could pick `pid` for this pane: a descendant
+/// of the pane shell, or an escaped Git Bash agent with the pane's marker.
+fn process_belongs_to_pane(
+    shell_pid: u32,
+    pid: u32,
+    snapshot: &ProcessSnapshot,
+    shell_is_git_bash: impl FnOnce(&WindowsProcessEntry) -> bool,
+    mut runtime_marker: impl FnMut(&WindowsProcessEntry) -> Option<String>,
+) -> bool {
+    if process_is_ancestor(shell_pid, pid, snapshot) {
+        return true;
+    }
+    let (Some(shell), Some(entry)) = (snapshot.entry(shell_pid), snapshot.entry(pid)) else {
+        return false;
+    };
+    shell_is_git_bash(shell)
+        && process_entry_identifies_agent(entry)
+        && pane_runtime_marker(shell, &mut runtime_marker).is_some_and(|pane_marker| {
+            carries_pane_runtime_marker(entry, &pane_marker, &mut runtime_marker)
+        })
+}
+
+/// Creation time of `pid`. It tells a process apart from a later one that
+/// reuses its pid.
+pub fn process_start_token(pid: u32) -> Option<u64> {
+    ProcessIdentity::open(pid)?.creation_time()
+}
+
+/// Returns `pid` while that same process, matched by its creation time, is
+/// still running for the pane shell `shell_pid`. Windows has no job control,
+/// so the process stands in for its own group.
+pub fn live_pane_process_group(shell_pid: u32, pid: u32, start_token: u64) -> Option<u32> {
+    let identity = ProcessIdentity::open(pid)?;
+    if !identity.running() || identity.creation_time() != Some(start_token) {
+        return None;
+    }
+    process_belongs_to_pane(
+        shell_pid,
+        pid,
+        &cached_foreground_processes(),
+        |shell| process_is_git_bash(shell.pid),
+        |entry| process_runtime_marker(entry.pid),
+    )
+    .then_some(pid)
+}
+
 fn process_entry_identifies_agent(entry: &WindowsProcessEntry) -> bool {
-    crate::detect::identify_agent_in_job(&foreground_job_from_entry(entry)).is_some()
+    crate::detect::identify_agent(&entry.name).is_some()
+        || crate::detect::identify_agent_in_job(&foreground_job_from_entry(entry)).is_some()
 }
 
 fn foreground_job_from_entry(entry: &WindowsProcessEntry) -> ForegroundJob {
@@ -624,29 +1836,24 @@ fn foreground_job_from_entry(entry: &WindowsProcessEntry) -> ForegroundJob {
 
 fn select_topmost_agent_chain_candidate<'a>(
     candidates: &[&'a WindowsProcessEntry],
-    entries: &[WindowsProcessEntry],
+    snapshot: &ProcessSnapshot,
 ) -> Option<&'a WindowsProcessEntry> {
-    let parent_by_pid: HashMap<u32, u32> = entries
-        .iter()
-        .map(|entry| (entry.pid, entry.parent_pid))
-        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
 
     candidates.iter().copied().find(|entry| {
         candidates.iter().all(|other| {
-            entry.pid == other.pid || process_is_ancestor(entry.pid, other.pid, &parent_by_pid)
+            entry.pid == other.pid || process_is_ancestor(entry.pid, other.pid, snapshot)
         })
     })
 }
 
-fn process_is_ancestor(
-    ancestor_pid: u32,
-    descendant_pid: u32,
-    parent_by_pid: &HashMap<u32, u32>,
-) -> bool {
+fn process_is_ancestor(ancestor_pid: u32, descendant_pid: u32, snapshot: &ProcessSnapshot) -> bool {
     let mut current = descendant_pid;
     let mut visited = HashSet::new();
     while visited.insert(current) {
-        let Some(parent) = parent_by_pid.get(&current).copied() else {
+        let Some(parent) = snapshot.entry(current).map(|entry| entry.parent_pid) else {
             return false;
         };
         if parent == ancestor_pid {
@@ -661,18 +1868,14 @@ fn process_is_ancestor(
     false
 }
 
-fn descendant_entries(root_pid: u32, entries: &[WindowsProcessEntry]) -> Vec<&WindowsProcessEntry> {
-    let mut children: HashMap<u32, Vec<&WindowsProcessEntry>> = HashMap::new();
-    for entry in entries {
-        children.entry(entry.parent_pid).or_default().push(entry);
-    }
-
+fn descendant_entries(root_pid: u32, snapshot: &ProcessSnapshot) -> Vec<&WindowsProcessEntry> {
     let mut output = Vec::new();
     let mut queue = VecDeque::new();
     let mut visited = HashSet::new();
     visited.insert(root_pid);
-    if let Some(root_children) = children.get(&root_pid) {
-        for entry in root_children.iter().copied() {
+    if let Some(root_children) = snapshot.children_by_parent.get(&root_pid) {
+        for &index in root_children {
+            let entry = &snapshot.entries[index];
             if visited.insert(entry.pid) {
                 queue.push_back(entry);
             }
@@ -680,8 +1883,9 @@ fn descendant_entries(root_pid: u32, entries: &[WindowsProcessEntry]) -> Vec<&Wi
     }
     while let Some(entry) = queue.pop_front() {
         output.push(entry);
-        if let Some(next) = children.get(&entry.pid) {
-            for child in next.iter().copied() {
+        if let Some(next) = snapshot.children_by_parent.get(&entry.pid) {
+            for &index in next {
+                let child = &snapshot.entries[index];
                 if visited.insert(child.pid) {
                     queue.push_back(child);
                 }
@@ -692,16 +1896,19 @@ fn descendant_entries(root_pid: u32, entries: &[WindowsProcessEntry]) -> Vec<&Wi
 }
 
 fn foreground_process_from_entry(entry: &WindowsProcessEntry) -> super::ForegroundProcess {
+    let command = entry.command();
     super::ForegroundProcess {
         pid: entry.pid,
         name: entry.name.clone(),
-        argv0: entry.argv0.clone(),
-        argv: entry.argv.clone(),
-        cmdline: entry.cmdline.clone(),
+        argv0: command.argv0.clone(),
+        argv: command.argv.clone(),
+        cmdline: command.cmdline.clone(),
     }
 }
 
 fn snapshot_processes() -> Vec<WindowsProcessEntry> {
+    #[cfg(test)]
+    PROCESS_INSPECTION_COUNTS.with_borrow_mut(|counts| counts.snapshots += 1);
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
     if snapshot == INVALID_HANDLE_VALUE {
         return Vec::new();
@@ -717,30 +1924,197 @@ fn snapshot_processes() -> Vec<WindowsProcessEntry> {
     while ok {
         let pid = entry.th32ProcessID;
         let name = nul_terminated_utf16_to_string(&entry.szExeFile);
-        let cmdline = process_command_line(pid);
-        let argv = cmdline.as_deref().and_then(command_line_to_argv);
-        let argv0 = argv
-            .as_ref()
-            .and_then(|argv| argv.first().cloned())
-            .or_else(|| (!name.is_empty()).then(|| name.clone()));
         output.push(WindowsProcessEntry {
             pid,
             parent_pid: entry.th32ParentProcessID,
             name,
-            argv0,
-            argv,
-            cmdline,
+            command: OnceLock::new(),
         });
         ok = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
     }
     output
 }
 
-fn cached_foreground_processes() -> Arc<Vec<WindowsProcessEntry>> {
+fn cached_foreground_processes() -> Arc<ProcessSnapshot> {
     let mut cache = FOREGROUND_PROCESS_SNAPSHOT_CACHE
         .lock()
         .unwrap_or_else(|err| err.into_inner());
     cache.snapshot(FOREGROUND_PROCESS_SNAPSHOT_CACHE_TTL, snapshot_processes)
+}
+
+fn fresh_foreground_processes() -> Arc<ProcessSnapshot> {
+    let mut cache = FOREGROUND_PROCESS_SNAPSHOT_CACHE
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    cache.snapshot(Duration::ZERO, snapshot_processes)
+}
+
+fn prepare_cached_foreground_selection(
+    shell_pid: u32,
+    snapshot: &ProcessSnapshot,
+    job: &ForegroundJob,
+) -> Option<CachedForegroundSelection> {
+    if !CachedForegroundSelection::can_cache(shell_pid, snapshot, job) {
+        return None;
+    }
+    let shell_identity = ProcessIdentity::open(shell_pid)?;
+    let selected_identity = ProcessIdentity::open(job.process_group_id)?;
+    let descendants = snapshot.descendant_signatures(shell_pid);
+    let descendant_identities = descendants
+        .iter()
+        .map(|entry| ProcessIdentity::open(entry.pid))
+        .collect::<Option<Vec<_>>>()?;
+    CachedForegroundSelection::from_snapshot_with_identities(
+        shell_pid,
+        snapshot,
+        job,
+        descendants,
+        descendant_identities,
+        shell_identity,
+        selected_identity,
+    )
+}
+
+impl CachedForegroundSelection {
+    fn can_cache(shell_pid: u32, snapshot: &ProcessSnapshot, job: &ForegroundJob) -> bool {
+        // Idle native shells cannot use Git Bash's escaped-agent fallback.
+        // Keep reevaluating unknown children; a first child invalidates topology.
+        job.process_group_id != shell_pid
+            || (snapshot.entry(shell_pid).is_some_and(|shell| {
+                ["cmd.exe", "powershell.exe", "pwsh.exe"]
+                    .iter()
+                    .any(|name| shell.name.eq_ignore_ascii_case(name))
+            }) && !snapshot.children_by_parent.contains_key(&shell_pid))
+    }
+
+    fn from_snapshot_with_identities(
+        shell_pid: u32,
+        snapshot: &ProcessSnapshot,
+        job: &ForegroundJob,
+        descendants: Vec<ProcessSignature>,
+        descendant_identities: Vec<ProcessIdentity>,
+        shell_identity: ProcessIdentity,
+        selected_identity: ProcessIdentity,
+    ) -> Option<Self> {
+        if !Self::can_cache(shell_pid, snapshot, job) {
+            return None;
+        }
+        let shell_entry = snapshot.entry(shell_pid)?;
+        if shell_identity.creation_time() != shell_entry.command().creation_time {
+            return None;
+        }
+        let shell = ProcessSignature::from_entry(shell_entry);
+        let selected_entry = snapshot.entry(job.process_group_id)?;
+        if selected_identity.creation_time() != selected_entry.command().creation_time {
+            return None;
+        }
+        let selected = ProcessSignature::from_entry(selected_entry);
+        let descendants_match_identities = descendants.len() == descendant_identities.len()
+            && descendants
+                .iter()
+                .zip(&descendant_identities)
+                .all(|(signature, identity)| {
+                    snapshot.entry(signature.pid).is_some_and(|entry| {
+                        identity.creation_time() == entry.command().creation_time
+                    })
+                });
+        if !descendants_match_identities
+            || !shell_identity.running()
+            || !selected_identity.running()
+            || !descendant_identities.iter().all(ProcessIdentity::running)
+        {
+            return None;
+        }
+        let now = Instant::now();
+        Some(Self {
+            shell,
+            selected,
+            descendants,
+            descendant_identities,
+            shell_identity,
+            selected_identity,
+            job: job.clone(),
+            verified_at: now,
+            last_used: now,
+        })
+    }
+}
+
+impl ForegroundSelectionCache {
+    fn get(&mut self, shell_pid: u32, snapshot: &ProcessSnapshot) -> Option<ForegroundJob> {
+        if let Some(cached) = self.entries.get_mut(&shell_pid) {
+            let current_descendants = descendant_entries(shell_pid, snapshot);
+            let topology_matches = current_descendants.len() == cached.descendants.len()
+                && cached
+                    .descendants
+                    .iter()
+                    .all(|entry| entry.matches(snapshot.entry(entry.pid)));
+            let valid = cached.verified_at.elapsed() < FOREGROUND_SELECTION_RECHECK
+                && cached.shell_identity.running()
+                && cached.selected_identity.running()
+                && cached
+                    .descendant_identities
+                    .iter()
+                    .all(ProcessIdentity::running)
+                && cached.shell.matches(snapshot.entry(shell_pid))
+                && cached
+                    .selected
+                    .matches(snapshot.entry(cached.job.process_group_id))
+                && topology_matches;
+            if valid {
+                cached.last_used = Instant::now();
+                return Some(cached.job.clone());
+            }
+        }
+        self.entries.remove(&shell_pid);
+        None
+    }
+
+    fn remember(&mut self, shell_pid: u32, cached: Option<CachedForegroundSelection>) {
+        let Some(cached) = cached else {
+            self.entries.remove(&shell_pid);
+            return;
+        };
+        self.entries
+            .retain(|_, cached| cached.last_used.elapsed() < FOREGROUND_SELECTION_CACHE_RETENTION);
+        if self.entries.len() >= FOREGROUND_SELECTION_CACHE_CAPACITY {
+            self.entries.clear();
+        }
+        self.entries.insert(shell_pid, cached);
+    }
+
+    #[cfg(test)]
+    fn remember_for_test(
+        &mut self,
+        shell_pid: u32,
+        snapshot: &ProcessSnapshot,
+        job: &ForegroundJob,
+    ) {
+        let descendants = snapshot.descendant_signatures(shell_pid);
+        let descendant_identities = descendants
+            .iter()
+            .map(|_| ProcessIdentity::Stub {
+                running: true,
+                creation_time: None,
+            })
+            .collect();
+        let cached = CachedForegroundSelection::from_snapshot_with_identities(
+            shell_pid,
+            snapshot,
+            job,
+            descendants,
+            descendant_identities,
+            ProcessIdentity::Stub {
+                running: true,
+                creation_time: None,
+            },
+            ProcessIdentity::Stub {
+                running: true,
+                creation_time: None,
+            },
+        );
+        self.remember(shell_pid, cached);
+    }
 }
 
 impl ProcessSnapshotCache {
@@ -748,26 +2122,63 @@ impl ProcessSnapshotCache {
         &mut self,
         max_age: Duration,
         build: impl FnOnce() -> Vec<WindowsProcessEntry>,
-    ) -> Arc<Vec<WindowsProcessEntry>> {
+    ) -> Arc<ProcessSnapshot> {
         if let Some(cached) = &self.cached {
             if cached.built_at.elapsed() < max_age {
-                return Arc::clone(&cached.entries);
+                return Arc::clone(&cached.snapshot);
             }
         }
 
-        let entries = Arc::new(build());
+        let snapshot = Arc::new(ProcessSnapshot::new(build()));
         self.cached = Some(CachedProcessSnapshot {
             built_at: Instant::now(),
-            entries: Arc::clone(&entries),
+            snapshot: Arc::clone(&snapshot),
         });
-        entries
+        snapshot
     }
 }
 
-fn process_command_line(pid: u32) -> Option<String> {
-    let process = ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ)?;
-    let parameters = read_process_parameters(process.0)?;
-    read_unicode_string(process.0, parameters.command_line)
+fn read_process_command(pid: u32, name: &str) -> WindowsProcessCommand {
+    // Prefer the command-line information class: it needs only
+    // `PROCESS_QUERY_LIMITED_INFORMATION`, while the PEB path below also needs
+    // `PROCESS_VM_READ`, which hardened runtimes (Electron/Node) and security
+    // products deny. Without a command line an agent launched through a runtime
+    // is indistinguishable from a bare `node.exe`/`bun.exe` process, so the
+    // pane would never register as an agent.
+    if let Some(process) = ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION) {
+        if let Some(cmdline) = read_process_command_line(process.0) {
+            let creation_time = process_creation_time(process.0);
+            return WindowsProcessCommand::from_cmdline(name, creation_time, Some(cmdline));
+        }
+    }
+
+    let Some(process) =
+        ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ)
+    else {
+        let creation_time = ProcessHandle::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)
+            .and_then(|process| process_creation_time(process.0));
+        return WindowsProcessCommand::from_cmdline(name, creation_time, None);
+    };
+    let creation_time = process_creation_time(process.0);
+    let cmdline = read_process_parameters(process.0)
+        .and_then(|parameters| read_unicode_string(process.0, parameters.command_line));
+    WindowsProcessCommand::from_cmdline(name, creation_time, cmdline)
+}
+
+impl WindowsProcessCommand {
+    fn from_cmdline(name: &str, creation_time: Option<u64>, cmdline: Option<String>) -> Self {
+        let argv = cmdline.as_deref().and_then(command_line_to_argv);
+        let argv0 = argv
+            .as_ref()
+            .and_then(|argv| argv.first().cloned())
+            .or_else(|| (!name.is_empty()).then(|| name.to_string()));
+        Self {
+            creation_time,
+            argv0,
+            argv,
+            cmdline,
+        }
+    }
 }
 
 fn process_is_git_bash(pid: u32) -> bool {
@@ -1052,6 +2463,91 @@ fn environment_variable_from_utf16(environment: &[u16], name: &str) -> Option<St
     None
 }
 
+/// Read a process command line with only `PROCESS_QUERY_LIMITED_INFORMATION`.
+///
+/// `ProcessCommandLineInformation` has been available since Windows 8.1.
+/// Prefer it over walking the target PEB, which additionally requires
+/// `PROCESS_VM_READ` access that hardened runtimes and security products deny.
+///
+/// Returns `None` for a process without a stored command line; the caller then
+/// tries the PEB path before giving up.
+fn read_process_command_line(process: HANDLE) -> Option<String> {
+    #[cfg(test)]
+    PROCESS_INSPECTION_COUNTS.with_borrow_mut(|counts| counts.command_reads += 1);
+    let mut required = 0_u32;
+    // SAFETY: a null buffer with length 0 only asks for the required size, and
+    // `required` is a valid out-pointer for the duration of the call.
+    let status = unsafe {
+        NtQueryInformationProcess(
+            process,
+            ProcessCommandLineInformation,
+            null_mut(),
+            0,
+            &mut required,
+        )
+    };
+    // A process with no command line is already handled as a miss below.
+    if status != STATUS_BUFFER_TOO_SMALL
+        && status != STATUS_INFO_LENGTH_MISMATCH
+        && status != STATUS_BUFFER_OVERFLOW
+    {
+        return None;
+    }
+
+    // `required` is already at least a UNICODE_STRING sized buffer.
+    let mut buffer = vec![0_u8; required as usize];
+    for _ in 0..2 {
+        // SAFETY: `buffer` is `required` bytes and both pointers are valid for
+        // the call; the kernel writes the length back into `required`.
+        let status = unsafe {
+            NtQueryInformationProcess(
+                process,
+                ProcessCommandLineInformation,
+                buffer.as_mut_ptr().cast(),
+                required,
+                &mut required,
+            )
+        };
+        // These three statuses all mean the command line grew between the probe
+        // and the read. Some data was written; retry once with the larger buffer
+        // the call just reported. They are negative as `NTSTATUS`, so they must
+        // be checked before the failure test below.
+        let grew = status == STATUS_BUFFER_OVERFLOW
+            || status == STATUS_BUFFER_TOO_SMALL
+            || status == STATUS_INFO_LENGTH_MISMATCH;
+        if grew {
+            buffer = vec![0_u8; required as usize];
+            continue;
+        }
+        if status < 0 {
+            return None;
+        }
+        break;
+    }
+
+    // SAFETY: on success the kernel wrote a UNICODE_STRING followed by its
+    // UTF-16 contents into `buffer`. A `Vec<u8>` only guarantees byte
+    // alignment, so read the header unaligned.
+    let unicode = unsafe { buffer.as_ptr().cast::<UNICODE_STRING>().read_unaligned() };
+    let length = usize::from(unicode.Length);
+    // A short command line leaves `Length` inside the header itself; guard
+    // against reading a malformed header as string data.
+    if length == 0 || !length.is_multiple_of(2) {
+        return None;
+    }
+    let string_offset = size_of::<UNICODE_STRING>();
+    if string_offset + length > buffer.len() {
+        return None;
+    }
+    let units = buffer[string_offset..string_offset + length]
+        .chunks_exact(2)
+        .map(|unit| u16::from_ne_bytes([unit[0], unit[1]]))
+        .collect::<Vec<_>>();
+    String::from_utf16(&units)
+        .ok()
+        .filter(|command_line| !command_line.is_empty())
+}
+
 fn read_process_parameters(process: HANDLE) -> Option<RtlUserProcessParameters> {
     let mut basic_info = MaybeUninit::<PROCESS_BASIC_INFORMATION>::uninit();
     let status = unsafe {
@@ -1126,18 +2622,18 @@ pub fn session_processes(child_pid: u32) -> Vec<u32> {
         return Vec::new();
     }
 
-    let entries = snapshot_processes();
-    session_processes_from_entries(child_pid, &entries)
+    let snapshot = ProcessSnapshot::new(snapshot_processes());
+    session_processes_from_snapshot(child_pid, &snapshot)
 }
 
-fn session_processes_from_entries(child_pid: u32, entries: &[WindowsProcessEntry]) -> Vec<u32> {
-    if !entries.iter().any(|entry| entry.pid == child_pid) {
+fn session_processes_from_snapshot(child_pid: u32, snapshot: &ProcessSnapshot) -> Vec<u32> {
+    if snapshot.entry(child_pid).is_none() {
         return Vec::new();
     }
 
     let mut pids = vec![child_pid];
     pids.extend(
-        descendant_entries(child_pid, entries)
+        descendant_entries(child_pid, snapshot)
             .into_iter()
             .map(|entry| entry.pid),
     );
@@ -1168,6 +2664,8 @@ pub fn process_exists(pid: u32) -> bool {
     let ok = unsafe { GetExitCodeProcess(process.0, &mut exit_code) } != 0;
     ok && exit_code == STILL_ACTIVE
 }
+
+static LAST_CLIPBOARD_WRITE_SEQUENCE: AtomicU32 = AtomicU32::new(0);
 
 pub fn write_clipboard(bytes: &[u8]) -> bool {
     let Ok(text) = std::str::from_utf8(bytes) else {
@@ -1211,6 +2709,16 @@ pub fn write_clipboard(bytes: &[u8]) -> bool {
             return false;
         }
 
+        // Closing may generate additional text formats and advance the sequence.
+        drop(_clipboard);
+        // Read the sequence first: a later writer must not become our last write.
+        let sequence = GetClipboardSequenceNumber();
+        let sequence = if GetClipboardOwner() == owner {
+            sequence
+        } else {
+            0
+        };
+        LAST_CLIPBOARD_WRITE_SEQUENCE.store(sequence, AtomicOrdering::Relaxed);
         true
     }
 }
@@ -1219,7 +2727,77 @@ pub fn read_clipboard_text() -> Option<String> {
     None
 }
 
-pub fn open_url(url: &str) -> std::io::Result<()> {
+/// Whether the system clipboard currently holds exactly this text.
+///
+/// Returns `None` when the clipboard changed since our last write, cannot be read,
+/// or has non-text formats.
+/// Kept separate from [`read_clipboard_text`] so unsupported modal paste on
+/// Windows is unchanged.
+pub fn clipboard_text_matches(bytes: &[u8]) -> Option<bool> {
+    let current = read_clipboard_unicode_text()?;
+    Some(clipboard_text_equals(&current, bytes))
+}
+
+fn clipboard_text_equals(current: &str, bytes: &[u8]) -> bool {
+    let Ok(payload) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    normalized_clipboard_newlines(payload) == normalized_clipboard_newlines(current)
+}
+
+fn normalized_clipboard_newlines(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains("\r\n") {
+        std::borrow::Cow::Owned(text.replace("\r\n", "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
+fn plain_text_clipboard_format(format: u32) -> bool {
+    format == CF_UNICODETEXT as u32
+        || format == CF_TEXT as u32
+        || format == CF_OEMTEXT as u32
+        || format == CF_LOCALE as u32
+}
+
+fn read_clipboard_unicode_text() -> Option<String> {
+    const MAX_CLIPBOARD_TEXT_BYTES: usize = 1024 * 1024;
+
+    for attempt in 0..10 {
+        if unsafe { OpenClipboard(null_mut()) } != 0 {
+            let _clipboard = ClipboardGuard;
+            let sequence = unsafe { GetClipboardSequenceNumber() };
+            if sequence == 0
+                || sequence != LAST_CLIPBOARD_WRITE_SEQUENCE.load(AtomicOrdering::Relaxed)
+            {
+                return None;
+            }
+            let format_count = unsafe { CountClipboardFormats() };
+            if format_count <= 0 {
+                return None;
+            }
+            let mut format = 0;
+            for _ in 0..format_count {
+                format = unsafe { EnumClipboardFormats(format) };
+                if format == 0 || !plain_text_clipboard_format(format) {
+                    return None;
+                }
+            }
+            let bytes = clipboard_global_bytes(CF_UNICODETEXT as u32, MAX_CLIPBOARD_TEXT_BYTES)?;
+            let units = bytes
+                .chunks_exact(2)
+                .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+                .take_while(|unit| *unit != 0);
+            return String::from_utf16(&units.collect::<Vec<_>>()).ok();
+        }
+        if attempt < 9 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+    None
+}
+
+pub fn open_url(url: &str) -> std::io::Result<Option<std::process::Child>> {
     let operation = wide_null("open");
     let url = wide_null(url);
     let result = unsafe {
@@ -1233,7 +2811,7 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
         )
     };
     if result as isize > 32 {
-        Ok(())
+        Ok(None)
     } else {
         Err(std::io::Error::other(format!(
             "failed to open URL with ShellExecuteW: code {}",
@@ -1242,116 +2820,74 @@ pub fn open_url(url: &str) -> std::io::Result<()> {
     }
 }
 
-// Windows does not wire clipboard-image bridging into semantic input yet.
-#[cfg_attr(windows, allow(dead_code))]
 pub fn read_clipboard_image() -> Option<ClipboardImage> {
+    for attempt in 0..10 {
+        if unsafe { OpenClipboard(null_mut()) } != 0 {
+            let _clipboard = ClipboardGuard;
+            if let Some(bytes) = read_registered_png_clipboard() {
+                return Some(ClipboardImage {
+                    bytes,
+                    extension: "png",
+                });
+            }
+            for format in [CF_DIBV5 as u32, CF_DIB as u32] {
+                if let Some(bytes) =
+                    clipboard_global_bytes(format, clipboard_image::MAX_CLIPBOARD_ALLOCATION)
+                {
+                    if let Some(bytes) = clipboard_image::dib_to_png(&bytes) {
+                        return Some(ClipboardImage {
+                            bytes,
+                            extension: "png",
+                        });
+                    }
+                }
+            }
+            return None;
+        }
+        if attempt < 9 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
     None
 }
 
-pub fn show_desktop_notification(title: &str, body: Option<&str>) -> std::io::Result<bool> {
-    let title = title.to_owned();
-    let body = body.unwrap_or(&title).to_owned();
-    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-    std::thread::Builder::new()
-        .name("herdr-windows-notification".into())
-        .spawn(move || show_desktop_notification_on_thread(&title, &body, ready_tx))?;
-    ready_rx
-        .recv_timeout(Duration::from_secs(2))
-        .map_err(|err| match err {
-            std::sync::mpsc::RecvTimeoutError::Timeout => std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "Windows notification setup timed out",
-            ),
-            std::sync::mpsc::RecvTimeoutError::Disconnected => std::io::Error::other(
-                "Windows notification thread exited before reporting readiness",
-            ),
-        })?
+fn read_registered_png_clipboard() -> Option<Vec<u8>> {
+    static PNG_FORMAT: LazyLock<u32> = LazyLock::new(|| {
+        let name = wide_null("PNG");
+        unsafe { RegisterClipboardFormatW(name.as_ptr()) }
+    });
+    if *PNG_FORMAT == 0 {
+        return None;
+    }
+    let bytes = clipboard_global_bytes(
+        *PNG_FORMAT,
+        crate::protocol::MAX_CLIPBOARD_IMAGE_PAYLOAD + 64 * 1024,
+    )?;
+    clipboard_image::validated_png(&bytes)
 }
 
-fn show_desktop_notification_on_thread(
-    title: &str,
-    body: &str,
-    ready_tx: std::sync::mpsc::SyncSender<std::io::Result<bool>>,
-) {
-    let class_name = wide_null("STATIC");
-    let window_name = wide_null("Herdr notifications");
-    let hwnd = unsafe {
-        CreateWindowExW(
-            0,
-            class_name.as_ptr(),
-            window_name.as_ptr(),
-            0,
-            0,
-            0,
-            0,
-            0,
-            null_mut(),
-            null_mut(),
-            null_mut(),
-            std::ptr::null(),
-        )
-    };
-    if hwnd.is_null() {
-        let _ = ready_tx.send(Err(std::io::Error::last_os_error()));
-        return;
+fn clipboard_global_bytes(format: u32, max_bytes: usize) -> Option<Vec<u8>> {
+    let handle = unsafe { GetClipboardData(format) };
+    if handle.is_null() {
+        return None;
     }
-
-    let mut notification = unsafe { std::mem::zeroed::<NOTIFYICONDATAW>() };
-    notification.cbSize = size_of::<NOTIFYICONDATAW>() as u32;
-    notification.hWnd = hwnd;
-    notification.uID = 1;
-    notification.hIcon = unsafe { LoadIconW(null_mut(), IDI_APPLICATION) };
-    notification.uFlags = NIF_TIP;
-    if !notification.hIcon.is_null() {
-        notification.uFlags |= NIF_ICON;
+    let data = unsafe { GlobalLock(handle) };
+    if data.is_null() {
+        return None;
     }
-    copy_wide_truncated(&mut notification.szTip, "Herdr");
-
-    if unsafe { Shell_NotifyIconW(NIM_ADD, &notification) } == 0 {
-        let _ = ready_tx.send(Err(std::io::Error::other(
-            "failed to add Herdr notification-area icon",
-        )));
+    let size = unsafe { GlobalSize(handle) };
+    if size == 0 || size > max_bytes {
         unsafe {
-            DestroyWindow(hwnd);
+            GlobalUnlock(handle);
         }
-        return;
+        return None;
     }
-
-    notification.uFlags = NIF_INFO;
-    notification.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
-    copy_wide_truncated(&mut notification.szInfoTitle, title);
-    copy_wide_truncated(&mut notification.szInfo, body);
-    if unsafe { Shell_NotifyIconW(NIM_MODIFY, &notification) } == 0 {
-        unsafe {
-            Shell_NotifyIconW(NIM_DELETE, &notification);
-            DestroyWindow(hwnd);
-        }
-        let _ = ready_tx.send(Err(std::io::Error::other(
-            "failed to show Herdr desktop notification",
-        )));
-        return;
-    }
-
-    let _ = ready_tx.send(Ok(true));
-    std::thread::sleep(Duration::from_secs(10));
+    let mut bytes = vec![0_u8; size];
     unsafe {
-        Shell_NotifyIconW(NIM_DELETE, &notification);
-        DestroyWindow(hwnd);
+        copy_nonoverlapping(data.cast::<u8>(), bytes.as_mut_ptr(), size);
+        GlobalUnlock(handle);
     }
-}
-
-fn copy_wide_truncated<const N: usize>(destination: &mut [u16; N], value: &str) {
-    destination.fill(0);
-    let mut offset = 0;
-    for ch in value.chars() {
-        let mut units = [0; 2];
-        let encoded = ch.encode_utf16(&mut units);
-        if offset + encoded.len() >= N {
-            break;
-        }
-        destination[offset..offset + encoded.len()].copy_from_slice(encoded);
-        offset += encoded.len();
-    }
+    Some(bytes)
 }
 
 fn wide_null(value: &str) -> Vec<u16> {
@@ -1375,6 +2911,8 @@ impl ProcessHandle {
         if pid == 0 {
             return None;
         }
+        #[cfg(test)]
+        PROCESS_INSPECTION_COUNTS.with_borrow_mut(|counts| counts.opens += 1);
         let handle = unsafe { OpenProcess(access, 0, pid) };
         (!handle.is_null()).then_some(Self(handle))
     }
@@ -1397,6 +2935,24 @@ struct Peb {
     reserved3: [*mut c_void; 2],
     ldr: *mut c_void,
     process_parameters: *mut RtlUserProcessParameters,
+}
+
+// Prefixes of the x86 PEB and RTL_USER_PROCESS_PARAMETERS through the fields
+// needed for cwd; remote pointers must stay 32-bit on a 64-bit reader.
+#[cfg(target_pointer_width = "64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Peb32 {
+    reserved: [u32; 4],
+    process_parameters: u32,
+}
+
+#[cfg(target_pointer_width = "64")]
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ProcessCwdParameters32 {
+    reserved: [u32; 9],
+    current_directory: STRING32,
 }
 
 #[repr(C)]
@@ -1788,29 +3344,290 @@ mod tests {
     };
 
     #[test]
+    fn local_resources_authorize_account_without_admin_rights() {
+        use interprocess::local_socket::traits::Listener as _;
+        use std::io::{Read, Write};
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::Security::{
+            CreateRestrictedToken, GetTokenInformation, ImpersonateLoggedOnUser, RevertToSelf,
+            TokenUser, DISABLE_MAX_PRIVILEGE, LUA_TOKEN, SID_AND_ATTRIBUTES, TOKEN_DUPLICATE,
+            TOKEN_QUERY, TOKEN_USER,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        let path =
+            std::env::temp_dir().join(format!("herdr-user-pipe-{}.sock", std::process::id()));
+        let listener = crate::ipc::bind_local_listener(&path).unwrap();
+        let mut raw_token = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                OpenProcessToken(
+                    GetCurrentProcess(),
+                    TOKEN_DUPLICATE | TOKEN_QUERY,
+                    &mut raw_token,
+                )
+            },
+            0
+        );
+        let token = unsafe { OwnedHandle::from_raw_handle(raw_token) };
+        let mut restricted = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                CreateRestrictedToken(
+                    token.as_raw_handle(),
+                    DISABLE_MAX_PRIVILEGE | LUA_TOKEN,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    &mut restricted,
+                )
+            },
+            0
+        );
+        let restricted = unsafe { OwnedHandle::from_raw_handle(restricted) };
+        let private_path = path.with_extension("private");
+        super::create_config_temporary(&private_path, true)
+            .unwrap()
+            .write_all(b"recovery")
+            .unwrap();
+        assert_ne!(
+            unsafe { ImpersonateLoggedOnUser(restricted.as_raw_handle()) },
+            0
+        );
+        let connection = crate::ipc::connect_local_stream(&path);
+        let private_read = fs::read(&private_path);
+        let private_write = fs::write(&private_path, b"updated");
+        let reverted = unsafe { RevertToSelf() };
+        assert_ne!(reverted, 0);
+        assert_eq!(private_read.unwrap(), b"recovery");
+        private_write.unwrap();
+        let mut client = connection.expect("the account SID must work without admin membership");
+        let mut server = listener.accept().unwrap();
+        client.write_all(b"account").unwrap();
+        let mut received = [0; 7];
+        server.read_exact(&mut received).unwrap();
+        assert_eq!(&received, b"account");
+
+        // Removing the account SID must not leave access through Everyone or
+        // another ordinary group. This exercises the real DACL access check.
+        let mut size = 0;
+        unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenUser,
+                std::ptr::null_mut(),
+                0,
+                &mut size,
+            )
+        };
+        let mut user = vec![0usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
+        assert_ne!(
+            unsafe {
+                GetTokenInformation(
+                    token.as_raw_handle(),
+                    TokenUser,
+                    user.as_mut_ptr().cast(),
+                    size,
+                    &mut size,
+                )
+            },
+            0
+        );
+        let user = unsafe { &*user.as_ptr().cast::<TOKEN_USER>() };
+        let disabled = SID_AND_ATTRIBUTES {
+            Sid: user.User.Sid,
+            Attributes: 0,
+        };
+        let mut without_account = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                CreateRestrictedToken(
+                    token.as_raw_handle(),
+                    DISABLE_MAX_PRIVILEGE | LUA_TOKEN,
+                    1,
+                    &disabled,
+                    0,
+                    std::ptr::null(),
+                    0,
+                    std::ptr::null(),
+                    &mut without_account,
+                )
+            },
+            0
+        );
+        let without_account = unsafe { OwnedHandle::from_raw_handle(without_account) };
+        assert_ne!(
+            unsafe { ImpersonateLoggedOnUser(without_account.as_raw_handle()) },
+            0
+        );
+        let denied = crate::ipc::connect_local_stream(&path);
+        let private_denied = fs::read(&private_path);
+        let reverted = unsafe { RevertToSelf() };
+        assert_ne!(reverted, 0);
+        assert_eq!(
+            denied.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            private_denied.unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        assert_ne!(
+            unsafe { ImpersonateLoggedOnUser(restricted.as_raw_handle()) },
+            0
+        );
+        let removed = fs::remove_file(private_path);
+        let reverted = unsafe { RevertToSelf() };
+        assert_ne!(reverted, 0);
+        removed.expect("the account must be able to remove its private recovery files");
+        drop(client);
+        drop(server);
+        drop(listener);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn clipboard_text_equals_normalizes_line_endings() {
+        assert!(super::clipboard_text_equals("hello", b"hello"));
+        assert!(super::clipboard_text_equals("a\r\nb", b"a\nb"));
+        assert!(super::clipboard_text_equals("a\nb", b"a\r\nb"));
+        assert!(!super::clipboard_text_equals("hello ", b"hello"));
+        assert!(!super::clipboard_text_equals("hello", b"world"));
+        assert!(!super::clipboard_text_equals("hello", &[0xff]));
+        assert!(!super::clipboard_text_equals("a\rb", b"a\nb"));
+    }
+
+    #[test]
+    fn clipboard_format_check_rejects_rich_content() {
+        for format in [
+            super::CF_UNICODETEXT,
+            super::CF_TEXT,
+            super::CF_OEMTEXT,
+            super::CF_LOCALE,
+        ] {
+            assert!(super::plain_text_clipboard_format(format as u32));
+        }
+        assert!(!super::plain_text_clipboard_format(super::CF_DIB as u32));
+        assert!(!super::plain_text_clipboard_format(0xC000));
+    }
+
+    #[test]
+    fn windows_standard_plugin_runtime_paths_drop_only_disk_and_unc_verbatim_prefixes() {
+        assert_eq!(
+            super::standard_windows_path(std::path::Path::new(r"\\?\C:\plugins\example")),
+            Some(std::path::PathBuf::from(r"C:\plugins\example"))
+        );
+        assert_eq!(
+            super::standard_windows_path(std::path::Path::new(
+                r"\\?\UNC\server\share\plugins\example"
+            )),
+            Some(std::path::PathBuf::from(r"\\server\share\plugins\example"))
+        );
+        assert_eq!(
+            super::standard_windows_path(std::path::Path::new(
+                r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}\plugins"
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn windows_plugin_runtime_path_keeps_extended_path_when_normal_form_is_not_equivalent() {
+        let path = std::path::PathBuf::from(format!(
+            r"\\?\C:\herdr-missing-plugin-runtime-path-{}",
+            std::process::id()
+        ));
+        assert_eq!(super::plugin_runtime_path_platform(&path), path);
+    }
+
+    #[test]
+    fn windows_plugin_runtime_path_keeps_verbatim_root_beyond_max_path() {
+        use std::os::windows::ffi::OsStrExt;
+
+        let base = std::env::temp_dir().join(format!(
+            "herdr-plugin-runtime-path-limit-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&base).expect("create test base");
+        let extended_base = base.canonicalize().expect("canonicalize test base");
+        let normal_base = super::standard_windows_path(&extended_base)
+            .expect("test base has a standard drive path");
+        let normal_base_len = normal_base.as_os_str().encode_wide().count();
+        let root_at_length = |length| {
+            let component_len = length - normal_base_len - 1;
+            let path = extended_base.join("é".repeat(component_len));
+            fs::create_dir(&path).expect("create length-boundary test root");
+            path.canonicalize()
+                .expect("canonicalize length-boundary test root")
+        };
+
+        let at_limit = root_at_length(windows_sys::Win32::Foundation::MAX_PATH as usize - 2);
+        let at_limit_normal =
+            super::standard_windows_path(&at_limit).expect("convert root at MAX_PATH boundary");
+        assert_eq!(
+            super::plugin_runtime_path_platform(&at_limit),
+            at_limit_normal
+        );
+
+        let beyond_limit = root_at_length(windows_sys::Win32::Foundation::MAX_PATH as usize - 1);
+        assert_eq!(
+            super::plugin_runtime_path_platform(&beyond_limit),
+            beyond_limit
+        );
+
+        fs::remove_dir_all(base).expect("remove test directory");
+    }
+
+    #[test]
+    fn paste_text_uses_windows_line_endings() {
+        assert_eq!(
+            super::prepare_paste_text_for_pty_platform("one\ntwo\r\nthree\rfour".to_owned()),
+            "one\r\ntwo\r\nthree\rfour"
+        );
+    }
+
+    #[test]
+    fn private_remote_directory_supports_long_paths() {
+        let base = std::env::temp_dir().join(format!(
+            "herdr-private-remote-dir-test-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&base).expect("create test base");
+        let private = base.join("x".repeat(240));
+
+        super::create_remote_private_dir(&private).expect("create private long-path directory");
+        fs::write(private.join("probe"), b"ok").expect("write inherited private file");
+
+        fs::remove_dir_all(base).expect("remove test directory");
+    }
+
+    #[test]
     fn windows_conpty_native_encoder_uses_canonical_phase_and_repeat_count() {
         let key = crate::input::TerminalKey::new(
-            crossterm::event::KeyCode::Esc,
-            crossterm::event::KeyModifiers::empty(),
+            crossterm::event::KeyCode::Char('7'),
+            crossterm::event::KeyModifiers::CONTROL,
         )
         .with_windows_record(crate::input::WindowsKeyRecord {
             key_down: true,
             repeat_count: 3,
-            virtual_key_code: 27,
-            virtual_scan_code: 1,
-            unicode: 27,
-            control_key_state: 0,
+            virtual_key_code: 0x37,
+            virtual_scan_code: 0x08,
+            unicode: 0,
+            control_key_state: 0x0008,
         });
 
         assert_eq!(
             super::encode_windows_conpty_fallback(&key),
-            Some(b"\x1b[27;1;27;1;0;3_".to_vec())
+            Some(b"\x1b[55;8;0;1;8;3_".to_vec())
         );
         let mut release = key.with_kind(crossterm::event::KeyEventKind::Release);
         release.repeat_count = 3;
         assert_eq!(
             super::encode_windows_conpty_fallback(&release),
-            Some(b"\x1b[27;1;27;0;0;1_".to_vec())
+            Some(b"\x1b[55;8;0;0;8;1_".to_vec())
         );
     }
 
@@ -1875,15 +3692,6 @@ mod tests {
     }
 
     #[test]
-    fn windows_notification_text_is_null_terminated_and_unicode_safe() {
-        let mut destination = [u16::MAX; 6];
-        super::copy_wide_truncated(&mut destination, "abc😀def");
-
-        assert_eq!(String::from_utf16(&destination[..5]).unwrap(), "abc😀");
-        assert_eq!(destination[5], 0);
-    }
-
-    #[test]
     fn powershell_agent_command_omits_argument_list_when_no_arguments_are_passed() {
         let argv = vec!["opencode".into()];
 
@@ -1905,6 +3713,7 @@ mod tests {
             "100%".into(),
             "wow!".into(),
             "a'b".into(),
+            "--model".into(),
         ];
         let command = super::interactive_shell_command(&argv, "cmd.exe").unwrap();
         let encoded = command.split_whitespace().last().unwrap();
@@ -1917,7 +3726,7 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(
             String::from_utf16(&utf16).unwrap(),
-            "$p=Start-Process -FilePath pi -ArgumentList '\"\" \"two words\" 100% wow! a''b' -NoNewWindow -Wait -PassThru"
+            "if((Get-Command pi -ErrorAction SilentlyContinue).CommandType -eq 'ExternalScript'){& pi '' 'two words' '100%' 'wow!' 'a''b' '--model'}else{Start-Process -FilePath pi -ArgumentList '\"\" \"two words\" 100% wow! a''b --model' -NoNewWindow -Wait}"
         );
     }
 
@@ -1936,7 +3745,7 @@ mod tests {
         let helper = base.join("pi.cmd");
         fs::write(
             &helper,
-            "@echo off\r\n>\"%HERDR_ARGV_CAPTURE%\" (\r\necho(%~1\r\necho(%~2\r\necho(%~3\r\necho(%~4\r\necho(%~5\r\necho(%~6\r\n)\r\n",
+            "@echo off\r\n>\"%HERDR_ARGV_CAPTURE%\" (\r\necho(%~1\r\necho(%~2\r\necho(%~3\r\necho(%~4\r\necho(%~5\r\necho(%~6\r\necho(%~7\r\n)\r\n",
         )
         .unwrap();
         let argv = vec![
@@ -1947,6 +3756,7 @@ mod tests {
             "wow!".into(),
             "a'b".into(),
             "@options".into(),
+            "--model".into(),
         ];
         let inherited_path = std::env::var_os("PATH").unwrap_or_default();
         let path = format!("{};{}", base.display(), inherited_path.to_string_lossy());
@@ -1963,6 +3773,7 @@ mod tests {
             process
                 .env("PATH", &path)
                 .env("HERDR_ARGV_CAPTURE", capture)
+                .env("PSExecutionPolicyPreference", "Bypass")
                 .status()
                 .unwrap()
         };
@@ -1976,7 +3787,7 @@ mod tests {
                 fs::read_to_string(no_args_capture)
                     .unwrap()
                     .replace("\r\n", "\n"),
-                "\n\n\n\n\n\n"
+                "\n\n\n\n\n\n\n"
             );
 
             let capture = base.join(format!("{shell}.txt"));
@@ -1985,7 +3796,24 @@ mod tests {
             assert!(status.success(), "{shell} command failed");
             assert_eq!(
                 fs::read_to_string(capture).unwrap().replace("\r\n", "\n"),
-                "\ntwo words\n100%\nwow!\na'b\n@options\n"
+                "\ntwo words\n100%\nwow!\na'b\n@options\n--model\n"
+            );
+        }
+
+        fs::remove_file(helper).unwrap();
+        fs::write(
+            base.join("pi.ps1"),
+            "Set-Content -LiteralPath $env:HERDR_ARGV_CAPTURE -Value @(\"$($args[0])\", \"$($args[1])\", \"$($args[2])\", \"$($args[3])\", \"$($args[4])\", \"$($args[5])\", \"$($args[6])\")\r\n",
+        )
+        .unwrap();
+        for shell in ["powershell.exe", "cmd.exe"] {
+            let capture = base.join(format!("{shell}-ps1.txt"));
+            let command = super::interactive_shell_command(&argv, shell).unwrap();
+            let status = run_command(shell, &command, &capture);
+            assert!(status.success(), "{shell} PowerShell script command failed");
+            assert_eq!(
+                fs::read_to_string(capture).unwrap().replace("\r\n", "\n"),
+                "\ntwo words\n100%\nwow!\na'b\n@options\n--model\n"
             );
         }
 
@@ -1995,6 +3823,67 @@ mod tests {
     const CONSOLE_TEST_CHILD_ENV: &str = "HERDR_TEST_CONSOLE_CHILD_MODE";
     const CONSOLE_TEST_PARENT_PID_ENV: &str = "HERDR_TEST_CONSOLE_PARENT_PID";
     const WMI_DAEMON_TEST_CHILD_ENV: &str = "HERDR_TEST_WMI_DAEMON_CHILD";
+
+    #[test]
+    fn windows_daemon_readiness_checks_job_limits_and_console() {
+        const CHILD_ENV: &str = "HERDR_TEST_DAEMON_READINESS_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            use super::*;
+
+            let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+            assert!(!job.is_null(), "create test job");
+            let job = unsafe { OwnedHandle::from_raw_handle(job) };
+            assert_ne!(
+                unsafe { AssignProcessToJobObject(job.as_raw_handle(), GetCurrentProcess()) },
+                0,
+                "assign child to test job"
+            );
+            assert!(current_process_is_in_job().unwrap());
+            assert!(
+                current_process_is_detached_server_daemon(),
+                "a console-free process in a non-killing job must be ready"
+            );
+
+            for (flags, ready) in [(JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, false), (0, true)] {
+                let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+                limits.BasicLimitInformation.LimitFlags = flags;
+                assert_ne!(
+                    unsafe {
+                        SetInformationJobObject(
+                            job.as_raw_handle(),
+                            JobObjectExtendedLimitInformation,
+                            std::ptr::from_ref(&limits).cast(),
+                            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                        )
+                    },
+                    0,
+                    "set test job limits"
+                );
+                assert_eq!(current_process_is_detached_server_daemon(), ready);
+            }
+            assert_ne!(unsafe { AllocConsole() }, 0, "allocate test console");
+            assert!(!current_process_is_detached_server_daemon());
+            assert_ne!(unsafe { FreeConsole() }, 0, "release test console");
+            return;
+        }
+
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "platform::windows::tests::windows_daemon_readiness_checks_job_limits_and_console",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1");
+        super::detach_server_daemon_command(&mut child);
+        let output = child.output().expect("run daemon readiness child");
+        assert!(
+            output.status.success(),
+            "daemon readiness child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     #[test]
     fn windows_environment_keys_use_unicode_case_insensitive_ordering() {
@@ -2011,8 +3900,9 @@ mod tests {
             fs::write(
                 capture,
                 format!(
-                    "{}\n{}",
+                    "{}\n{}\n{}",
                     cwd.display(),
+                    unsafe { GetConsoleWindow() }.is_null(),
                     super::current_process_is_detached_server_daemon()
                 ),
             )
@@ -2044,7 +3934,7 @@ mod tests {
             .expect("launch detached process through WMI");
         assert_ne!(pid, 0, "WMI returned an invalid process id");
 
-        let expected = format!("{}\ntrue", base.display());
+        let expected = format!("{}\ntrue\ntrue", base.display());
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             if fs::read_to_string(&capture).is_ok_and(|captured| captured == expected) {
@@ -2105,7 +3995,8 @@ mod tests {
 
         let parent_pid = std::process::id().to_string();
         let test_exe = std::env::current_exe().expect("resolve test executable");
-        let configurations: [(&str, fn(&mut Command)); 2] = [
+        type ConfigureCommand = fn(&mut Command);
+        let configurations: [(&str, ConfigureCommand); 2] = [
             ("background", super::configure_background_command_platform),
             ("server daemon", super::detach_server_daemon_command),
         ];
@@ -2152,7 +4043,7 @@ mod tests {
     }
 
     fn argv_strings(argv: &[std::ffi::OsString]) -> Vec<String> {
-        argv.into_iter()
+        argv.iter()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect()
     }
@@ -2221,36 +4112,109 @@ mod tests {
     }
 
     #[test]
-    fn windows_process_cwd_reads_child_launch_directory() {
-        let cwd = std::env::temp_dir().join(format!("herdr-cwd-test-{}", std::process::id()));
+    fn windows_process_cwd_reads_normalized_child_launch_directory() {
+        use std::path::PathBuf;
+
+        let name = format!("Herdr-Cwd-Case-{}", std::process::id());
+        let cwd = std::env::temp_dir().join(&name);
         fs::create_dir_all(&cwd).expect("create cwd fixture");
-
-        let shell =
-            std::env::var_os("ComSpec").unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".into());
-        let mut child = Command::new(shell)
-            .args(["/D", "/Q", "/C", "ping -n 11 127.0.0.1 > NUL"])
-            .current_dir(&cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("spawn cmd");
-
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut observed = None;
-        while Instant::now() < deadline {
-            observed = super::process_cwd(child.id());
-            if observed.as_deref() == Some(cwd.as_path()) {
-                break;
-            }
-            thread::sleep(Duration::from_millis(100));
+        let cwd = super::normalize_cwd_for_launch_platform(&cwd);
+        let launch_cwd = cwd.with_file_name(name.to_ascii_lowercase());
+        let changed = cwd.join("Changed");
+        fs::create_dir(&changed).expect("create changed cwd");
+        let windows = PathBuf::from(std::env::var_os("SystemRoot").expect("Windows SystemRoot"));
+        let shells = [
+            windows.join("System32").join("cmd.exe"),
+            #[cfg(target_pointer_width = "64")]
+            windows.join("SysWOW64").join("cmd.exe"),
+        ];
+        let mut observations = Vec::new();
+        for shell in shells {
+            let mut child = Command::new(&shell)
+                .args(["/D", "/Q", "/K"])
+                .current_dir(super::normalize_cwd_for_launch_platform(&launch_cwd))
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn cmd");
+            let observe = |expected: &PathBuf| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let observed = super::process_cwd(child.id());
+                    if observed.as_ref() == Some(expected) || Instant::now() >= deadline {
+                        break observed;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                }
+            };
+            let initial = observe(&cwd);
+            use std::io::Write;
+            writeln!(
+                child.stdin.as_ref().unwrap(),
+                "cd /d \"{}\"\r",
+                changed.display()
+            )
+            .expect("change cmd cwd");
+            let after_cd = observe(&changed);
+            let pane_cwd = super::pane_process_cwd(child.id());
+            let _ = child.kill();
+            let _ = child.wait();
+            observations.push((shell, initial, after_cd, pane_cwd));
         }
-
-        let _ = child.kill();
-        let _ = child.wait();
         let _ = fs::remove_dir_all(&cwd);
+        for (shell, initial, after_cd, pane_cwd) in observations {
+            assert_eq!(initial, Some(cwd.clone()), "{} launch cwd", shell.display());
+            assert_eq!(
+                after_cd,
+                Some(changed.clone()),
+                "{} live cd",
+                shell.display()
+            );
+            assert_eq!(pane_cwd, Some(changed.clone()), "ordinary shell owns cwd");
+        }
+    }
 
-        assert_eq!(observed.as_deref(), Some(cwd.as_path()));
+    #[test]
+    fn windows_shim_cwd_uses_only_an_unambiguous_direct_shell() {
+        let cases = [
+            ("cmdx.exe", vec![(11, 10, "cmd.exe")], Some(11)),
+            ("pwsh.exe", vec![(11, 10, "pwsh.exe")], Some(11)),
+            (
+                "cmdx.exe",
+                vec![
+                    (11, 10, "cmd.exe"),
+                    (12, 11, "pwsh.exe"),
+                    (13, 11, "node.exe"),
+                ],
+                Some(11),
+            ),
+            (
+                "cmdx.exe",
+                vec![(11, 10, "node.exe"), (12, 11, "cmd.exe")],
+                None,
+            ),
+            ("cmdx.exe", vec![], None),
+            (
+                "cmdx.exe",
+                vec![(11, 10, "cmd.exe"), (12, 10, "pwsh.exe")],
+                None,
+            ),
+        ];
+        for (root_name, children, expected) in cases {
+            let mut entries = vec![test_entry(10, 1, root_name, &[root_name])];
+            entries.extend(
+                children
+                    .iter()
+                    .map(|&(pid, parent, name)| test_entry(pid, parent, name, &[name])),
+            );
+            let snapshot = super::ProcessSnapshot::new(entries);
+            assert_eq!(
+                super::shim_shell_pid(10, &snapshot),
+                expected,
+                "{root_name}: {children:?}"
+            );
+        }
     }
 
     #[test]
@@ -2283,15 +4247,69 @@ mod tests {
     }
 
     #[test]
+    fn windows_process_command_line_reads_live_process_with_limited_access() {
+        // The point of the fix: the command line must be readable from a handle
+        // that does not request `PROCESS_VM_READ`. Verification against a
+        // process that actually denies that access needs a hardened host, which
+        // this suite cannot provide.
+        let handle = super::ProcessHandle::open(
+            std::process::id(),
+            super::PROCESS_QUERY_LIMITED_INFORMATION,
+        )
+        .expect("open self with limited access");
+
+        let command_line =
+            super::read_process_command_line(handle.0).expect("command line must be readable");
+        assert!(
+            !command_line.is_empty(),
+            "command line for the test process must not be empty"
+        );
+    }
+
+    #[test]
+    fn windows_process_command_line_reads_spawned_process_marker() {
+        let shell =
+            std::env::var_os("ComSpec").unwrap_or_else(|| r"C:\Windows\System32\cmd.exe".into());
+        // `rem` keeps the marker inside cmd.exe's own command line without
+        // becoming a target for `ping`, so the process stays alive for the read.
+        let mut child = Command::new(shell)
+            .args([
+                "/D",
+                "/Q",
+                "/C",
+                "ping -n 11 127.0.0.1 > NUL & rem unique-cmdline-marker",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cmd");
+
+        let command_line =
+            super::ProcessHandle::open(child.id(), super::PROCESS_QUERY_LIMITED_INFORMATION)
+                .and_then(|process| super::read_process_command_line(process.0));
+
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let command_line = command_line.expect("command line must be readable");
+        assert!(
+            command_line.contains("unique-cmdline-marker"),
+            "unexpected command line: {command_line}"
+        );
+    }
+
+    #[test]
     fn windows_process_tree_selects_direct_agent_descendant() {
         let entries = vec![
             test_entry(10, 1, "powershell.exe", &["powershell.exe"]),
             test_entry(20, 10, "codex.exe", &["codex.exe"]),
         ];
+        let snapshot = super::ProcessSnapshot::new(entries);
 
-        let job = super::select_pane_foreground_job_with_runtime_inspection(
+        let job = super::select_pane_foreground_job_from_snapshot_with_runtime_inspection(
             10,
-            &entries,
+            &snapshot,
             |_| panic!("Git Bash fallback must not run after normal detection succeeds"),
             |_| panic!("runtime marker must not be read after normal detection succeeds"),
         )
@@ -2303,8 +4321,40 @@ mod tests {
     }
 
     #[test]
-    fn windows_process_tree_recovers_git_bash_exec_chain_from_runtime_marker() {
+    fn windows_process_tree_still_inspects_unusual_escaped_argv0() {
+        let snapshot = super::ProcessSnapshot::new(vec![
+            test_entry(10, 1, "bash.exe", &[r"C:\Program Files\Git\bin\bash.exe"]),
+            test_entry(20, 99, "launcher.exe", &["codex.exe"]),
+        ]);
+
+        let job = super::select_pane_foreground_job_from_snapshot_with_runtime_inspection(
+            10,
+            &snapshot,
+            |_| true,
+            |_| Some("pane-a".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(job.process_group_id, 20);
+        assert_eq!(job.processes[0].name, "launcher.exe");
+    }
+
+    #[test]
+    fn windows_process_tree_still_inspects_unusual_descendant_argv0() {
         let entries = vec![
+            test_entry(10, 1, "powershell.exe", &["powershell.exe"]),
+            test_entry(20, 10, "launcher.exe", &["codex.exe"]),
+        ];
+
+        let job = super::select_pane_foreground_job(10, &entries).unwrap();
+
+        assert_eq!(job.process_group_id, 20);
+        assert_eq!(job.processes[0].name, "launcher.exe");
+    }
+
+    #[test]
+    fn windows_process_tree_shares_snapshot_candidates_across_git_bash_panes() {
+        let snapshot = super::ProcessSnapshot::new(vec![
             test_entry(10, 1, "bash.exe", &[r"C:\Program Files\Git\bin\bash.exe"]),
             test_entry(
                 11,
@@ -2312,6 +4362,7 @@ mod tests {
                 "bash.exe",
                 &[r"C:\Program Files\Git\usr\bin\bash.exe"],
             ),
+            test_entry(12, 1, "bash.exe", &[r"C:\Program Files\Git\bin\bash.exe"]),
             test_entry(
                 20,
                 99,
@@ -2333,23 +4384,40 @@ mod tests {
                 "codex.exe",
                 &[r"C:\npm\node_modules\@openai\codex\bin\codex.exe"],
             ),
-        ];
+            test_entry(50, 98, "claude.exe", &["claude.exe"]),
+        ]);
         let mut inspected = Vec::new();
+        assert!(snapshot.agent_indices.get().is_none());
+        let marker = |entry: &super::WindowsProcessEntry| match entry.pid {
+            12 | 50 => Some("pane-b".to_string()),
+            _ => Some("pane-a".to_string()),
+        };
 
-        let job = super::select_pane_foreground_job_with_runtime_inspection(
+        let first = super::select_pane_foreground_job_from_snapshot_with_runtime_inspection(
             10,
-            &entries,
+            &snapshot,
             |_| true,
             |entry| {
                 inspected.push(entry.pid);
-                Some("pane-a".to_string())
+                marker(entry)
             },
         )
         .unwrap();
+        let indices = snapshot.agent_indices.get().unwrap();
+        let second = super::select_pane_foreground_job_from_snapshot_with_runtime_inspection(
+            12,
+            &snapshot,
+            |_| true,
+            marker,
+        )
+        .unwrap();
 
-        assert_eq!(job.process_group_id, 20);
-        assert_eq!(job.processes[0].name, "sh.exe");
-        assert_eq!(inspected, vec![10, 20, 30, 40]);
+        assert_eq!(first.process_group_id, 20);
+        assert_eq!(first.processes[0].name, "sh.exe");
+        assert_eq!(second.process_group_id, 50);
+        assert_eq!(indices, &[3, 4, 5, 6]);
+        assert!(std::ptr::eq(indices, snapshot.agent_indices.get().unwrap()));
+        assert_eq!(inspected, vec![10, 20, 30, 40, 50]);
     }
 
     #[test]
@@ -2358,10 +4426,11 @@ mod tests {
             test_entry(10, 1, "powershell.exe", &["powershell.exe"]),
             test_entry(20, 99, "codex.exe", &["codex.exe"]),
         ];
+        let snapshot = super::ProcessSnapshot::new(entries);
 
-        let job = super::select_pane_foreground_job_with_runtime_inspection(
+        let job = super::select_pane_foreground_job_from_snapshot_with_runtime_inspection(
             10,
-            &entries,
+            &snapshot,
             |_| false,
             |_| panic!("runtime marker must not be read for non-Git-Bash panes"),
         )
@@ -2376,10 +4445,11 @@ mod tests {
             test_entry(10, 1, "bash.exe", &[r"C:\Program Files\Git\bin\bash.exe"]),
             test_entry(20, 99, "git.exe", &["git.exe", "status"]),
         ];
+        let snapshot = super::ProcessSnapshot::new(entries);
 
-        let job = super::select_pane_foreground_job_with_runtime_inspection(
+        let job = super::select_pane_foreground_job_from_snapshot_with_runtime_inspection(
             10,
-            &entries,
+            &snapshot,
             |_| true,
             |_| panic!("runtime marker must not be read without an agent candidate"),
         )
@@ -2394,11 +4464,12 @@ mod tests {
             test_entry(10, 1, "bash.exe", &[r"C:\Program Files\Git\bin\bash.exe"]),
             test_entry(20, 99, "codex.exe", &["codex.exe"]),
         ];
+        let snapshot = super::ProcessSnapshot::new(entries);
 
         for shell_marker in [None, Some(String::new())] {
-            let job = super::select_pane_foreground_job_with_runtime_inspection(
+            let job = super::select_pane_foreground_job_from_snapshot_with_runtime_inspection(
                 10,
-                &entries,
+                &snapshot,
                 |_| true,
                 |entry| {
                     if entry.pid == 10 {
@@ -2420,10 +4491,11 @@ mod tests {
             test_entry(10, 1, "bash.exe", &[r"C:\Program Files\Git\bin\bash.exe"]),
             test_entry(20, 99, "codex.exe", &["codex.exe"]),
         ];
+        let snapshot = super::ProcessSnapshot::new(entries);
 
-        let job = super::select_pane_foreground_job_with_runtime_inspection(
+        let job = super::select_pane_foreground_job_from_snapshot_with_runtime_inspection(
             10,
-            &entries,
+            &snapshot,
             |_| true,
             |entry| Some(if entry.pid == 10 { "pane-a" } else { "pane-b" }.to_string()),
         )
@@ -2434,16 +4506,61 @@ mod tests {
     }
 
     #[test]
+    fn windows_held_agent_must_still_belong_to_the_pane() {
+        let entries = vec![
+            test_entry(10, 1, "bash.exe", &[r"C:\Program Files\Git\bin\bash.exe"]),
+            test_entry(11, 10, "claude.exe", &["claude.exe"]),
+            test_entry(20, 99, "codex.exe", &["codex.exe"]),
+            test_entry(30, 98, "vim.exe", &["vim.exe"]),
+            test_entry(50, 77, "claude.exe", &["claude.exe"]),
+        ];
+        let snapshot = super::ProcessSnapshot::new(entries);
+        let marker = |pane: &'static str| {
+            move |entry: &super::WindowsProcessEntry| {
+                Some(if entry.pid == 10 { "pane-a" } else { pane }.to_string())
+            }
+        };
+        let belongs = |pid, git_bash, pane| {
+            super::process_belongs_to_pane(10, pid, &snapshot, |_| git_bash, marker(pane))
+        };
+
+        assert!(belongs(11, false, "pane-b"), "descendant of the shell");
+        assert!(
+            belongs(20, true, "pane-a"),
+            "escaped agent with the pane marker"
+        );
+        assert!(!belongs(20, true, "pane-b"), "marker from another pane");
+        assert!(
+            !belongs(20, false, "pane-a"),
+            "escape only applies to Git Bash"
+        );
+        assert!(!belongs(30, true, "pane-a"), "escaped non-agent process");
+        assert!(
+            !belongs(40, true, "pane-a"),
+            "process gone from the snapshot"
+        );
+        assert!(
+            !belongs(50, false, "pane-a"),
+            "agent whose parent chain no longer reaches the shell"
+        );
+        assert!(
+            !super::process_belongs_to_pane(60, 11, &snapshot, |_| true, marker("pane-a")),
+            "pane shell gone"
+        );
+    }
+
+    #[test]
     fn windows_process_tree_rejects_ambiguous_runtime_marker_candidates() {
         let entries = vec![
             test_entry(10, 1, "bash.exe", &[r"C:\Program Files\Git\bin\bash.exe"]),
             test_entry(20, 99, "codex.exe", &["codex.exe"]),
             test_entry(30, 98, "claude.exe", &["claude.exe"]),
         ];
+        let snapshot = super::ProcessSnapshot::new(entries);
 
-        let job = super::select_pane_foreground_job_with_runtime_inspection(
+        let job = super::select_pane_foreground_job_from_snapshot_with_runtime_inspection(
             10,
-            &entries,
+            &snapshot,
             |_| true,
             |_| Some("pane-a".to_string()),
         )
@@ -2451,6 +4568,131 @@ mod tests {
 
         assert_eq!(job.process_group_id, 10);
         assert_eq!(job.processes[0].name, "bash.exe");
+    }
+
+    #[test]
+    #[ignore = "isolated 1/15/118-shell process-inspection profile"]
+    fn windows_process_inspection_profile() {
+        struct Shell {
+            child: Box<dyn portable_pty::Child + Send + Sync>,
+            pty: Option<portable_pty::PtyPair>,
+            reader: Option<thread::JoinHandle<()>>,
+        }
+        impl Drop for Shell {
+            fn drop(&mut self) {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                self.pty.take();
+                if let Some(reader) = self.reader.take() {
+                    let _ = reader.join();
+                }
+            }
+        }
+
+        fn cpu_time() -> Duration {
+            let mut creation = super::FILETIME::default();
+            let mut exit = super::FILETIME::default();
+            let mut kernel = super::FILETIME::default();
+            let mut user = super::FILETIME::default();
+            assert_ne!(
+                unsafe {
+                    super::GetProcessTimes(
+                        super::GetCurrentProcess(),
+                        &mut creation,
+                        &mut exit,
+                        &mut kernel,
+                        &mut user,
+                    )
+                },
+                0
+            );
+            let ticks = |time: super::FILETIME| {
+                (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime)
+            };
+            Duration::from_nanos((ticks(kernel) + ticks(user)) * 100)
+        }
+
+        let shell =
+            std::path::PathBuf::from(std::env::var_os("SystemRoot").expect("Windows SystemRoot"))
+                .join("System32")
+                .join("cmd.exe");
+        for panes in [1, 15, 118] {
+            let mut shells = Vec::new();
+            for _ in 0..panes {
+                let pty = portable_pty::native_pty_system()
+                    .openpty(portable_pty::PtySize {
+                        rows: 24,
+                        cols: 80,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .expect("open isolated fixed-geometry PTY");
+                let mut command = portable_pty::CommandBuilder::new(&shell);
+                command.args(["/D", "/Q", "/K"]);
+                let child = pty
+                    .slave
+                    .spawn_command(command)
+                    .expect("spawn isolated idle shell");
+                let mut reader = pty
+                    .master
+                    .try_clone_reader()
+                    .expect("clone profile PTY reader");
+                shells.push(Shell {
+                    child,
+                    pty: Some(pty),
+                    reader: Some(thread::spawn(move || {
+                        let _ = std::io::copy(&mut reader, &mut std::io::sink());
+                    })),
+                });
+            }
+            thread::sleep(Duration::from_millis(300));
+            let snapshot = super::ProcessSnapshot::new(super::snapshot_processes());
+            for shell in &shells {
+                assert!(
+                    super::descendant_entries(shell.child.process_id().unwrap(), &snapshot)
+                        .is_empty()
+                );
+            }
+            for sample in 0..3 {
+                super::FOREGROUND_PROCESS_SNAPSHOT_CACHE
+                    .lock()
+                    .unwrap()
+                    .cached = None;
+                super::FOREGROUND_SELECTION_CACHE
+                    .lock()
+                    .unwrap()
+                    .entries
+                    .clear();
+                super::PROCESS_INSPECTION_COUNTS
+                    .with_borrow_mut(|counts| *counts = super::ProcessInspectionCounts::default());
+                let started = Instant::now();
+                let cpu_started = cpu_time();
+                let mut inspection_time = Duration::ZERO;
+                for poll in 0..20 {
+                    let next_poll = started + Duration::from_millis(poll * 500);
+                    thread::sleep(next_poll.saturating_duration_since(Instant::now()));
+                    let inspecting = Instant::now();
+                    for shell in &mut shells {
+                        assert!(shell.child.try_wait().unwrap().is_none());
+                        let pid = shell.child.process_id().unwrap();
+                        let job = super::foreground_job(pid).expect("live shell job");
+                        assert_eq!(job.process_group_id, pid);
+                    }
+                    inspection_time += inspecting.elapsed();
+                }
+                let cpu = cpu_time() - cpu_started;
+                let counts = super::PROCESS_INSPECTION_COUNTS.with_borrow(|counts| *counts);
+                println!(
+                    "panes={panes} sample={sample} polls=20 snapshots={} opens={} command_reads={} inspection_ms={:.3} cpu_ms={:.3} elapsed_ms={:.3}",
+                    counts.snapshots,
+                    counts.opens,
+                    counts.command_reads,
+                    inspection_time.as_secs_f64() * 1000.0,
+                    cpu.as_secs_f64() * 1000.0,
+                    started.elapsed().as_secs_f64() * 1000.0,
+                );
+            }
+        }
     }
 
     #[test]
@@ -2478,7 +4720,258 @@ mod tests {
         assert!(Arc::ptr_eq(&first, &second));
         assert!(!Arc::ptr_eq(&second, &refreshed));
         assert_eq!(builds, 2);
-        assert_eq!(refreshed[0].pid, 20);
+        assert_eq!(refreshed.entries[0].pid, 20);
+    }
+
+    #[test]
+    fn windows_foreground_selection_cache_reuses_live_agent_and_invalidates_changes() {
+        let snapshot = super::ProcessSnapshot::new(vec![
+            test_entry(10, 1, "powershell.exe", &["powershell.exe"]),
+            test_entry(20, 10, "codex.exe", &["codex.exe"]),
+        ]);
+        let job = super::foreground_job_from_entry(snapshot.entry(20).unwrap());
+        let mut cache = super::ForegroundSelectionCache::default();
+        cache.remember_for_test(10, &snapshot, &job);
+
+        assert_eq!(cache.get(10, &snapshot), Some(job.clone()));
+
+        cache.entries.get_mut(&10).unwrap().selected_identity = super::ProcessIdentity::Stub {
+            running: false,
+            creation_time: None,
+        };
+        assert_eq!(cache.get(10, &snapshot), None);
+
+        cache.remember_for_test(10, &snapshot, &job);
+        let overlap = super::ProcessSnapshot::new(vec![
+            test_entry(10, 1, "powershell.exe", &["powershell.exe"]),
+            test_entry(20, 10, "codex.exe", &["codex.exe"]),
+            test_entry(30, 10, "claude.exe", &["claude.exe"]),
+        ]);
+        assert_eq!(cache.get(10, &overlap), None);
+
+        cache.remember_for_test(10, &snapshot, &job);
+        let changed = super::ProcessSnapshot::new(vec![
+            test_entry(10, 1, "powershell.exe", &["powershell.exe"]),
+            test_entry(20, 10, "git.exe", &["git.exe"]),
+        ]);
+        assert_eq!(cache.get(10, &changed), None);
+
+        cache.remember_for_test(10, &snapshot, &job);
+        cache.entries.get_mut(&10).unwrap().verified_at = Instant::now()
+            .checked_sub(super::FOREGROUND_SELECTION_RECHECK + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(cache.get(10, &snapshot), None);
+    }
+
+    #[test]
+    fn windows_foreground_selection_cache_rejects_reused_descendant_pid() {
+        let original = super::ProcessSnapshot::new(vec![
+            test_entry(10, 1, "powershell.exe", &["powershell.exe"]),
+            test_entry(20, 10, "codex.exe", &["codex.exe"]),
+            test_entry(30, 10, "node.exe", &["node.exe", "worker.js"]),
+        ]);
+        let job = super::foreground_job_from_entry(original.entry(20).unwrap());
+        let mut cache = super::ForegroundSelectionCache::default();
+        cache.remember_for_test(10, &original, &job);
+
+        let cached = cache.entries.get_mut(&10).unwrap();
+        let reused_index = cached
+            .descendants
+            .iter()
+            .position(|entry| entry.pid == 30)
+            .unwrap();
+        cached.descendant_identities[reused_index] = super::ProcessIdentity::Stub {
+            running: false,
+            creation_time: None,
+        };
+        let replacement = super::ProcessSnapshot::new(vec![
+            test_entry(10, 1, "powershell.exe", &["powershell.exe"]),
+            test_entry(20, 10, "codex.exe", &["codex.exe"]),
+            test_entry(30, 10, "node.exe", &["node.exe", "codex.js"]),
+        ]);
+
+        assert_eq!(cache.get(10, &replacement), None);
+    }
+
+    #[test]
+    fn windows_foreground_selection_cache_rejects_identity_change_before_insertion() {
+        let snapshot = super::ProcessSnapshot::new(vec![
+            test_entry_with_creation_time(10, 1, "powershell.exe", &["powershell.exe"], Some(1)),
+            test_entry_with_creation_time(20, 10, "codex.exe", &["codex.exe"], Some(2)),
+            test_entry_with_creation_time(30, 10, "node.exe", &["node.exe", "worker.js"], Some(3)),
+        ]);
+        let job = super::foreground_job_from_entry(snapshot.entry(20).unwrap());
+        let descendants = snapshot.descendant_signatures(10);
+        let descendant_identities = vec![
+            super::ProcessIdentity::Stub {
+                running: true,
+                creation_time: Some(2),
+            },
+            super::ProcessIdentity::Stub {
+                running: true,
+                creation_time: Some(4),
+            },
+        ];
+        let mut cache = super::ForegroundSelectionCache::default();
+
+        let cached = super::CachedForegroundSelection::from_snapshot_with_identities(
+            10,
+            &snapshot,
+            &job,
+            descendants,
+            descendant_identities,
+            super::ProcessIdentity::Stub {
+                running: true,
+                creation_time: Some(1),
+            },
+            super::ProcessIdentity::Stub {
+                running: true,
+                creation_time: Some(2),
+            },
+        );
+        cache.remember(10, cached);
+
+        assert!(cache.entries.is_empty());
+    }
+
+    #[test]
+    fn windows_foreground_selection_cache_accepts_limited_information_identity() {
+        let snapshot = super::ProcessSnapshot::new(vec![
+            test_entry_without_cmdline(10, 1, "powershell.exe", 1),
+            test_entry_without_cmdline(20, 10, "codex.exe", 2),
+        ]);
+        let job = super::foreground_job_from_entry(snapshot.entry(20).unwrap());
+        let cached = super::CachedForegroundSelection::from_snapshot_with_identities(
+            10,
+            &snapshot,
+            &job,
+            snapshot.descendant_signatures(10),
+            vec![super::ProcessIdentity::Stub {
+                running: true,
+                creation_time: Some(2),
+            }],
+            super::ProcessIdentity::Stub {
+                running: true,
+                creation_time: Some(1),
+            },
+            super::ProcessIdentity::Stub {
+                running: true,
+                creation_time: Some(2),
+            },
+        );
+
+        assert!(cached.is_some());
+        assert_eq!(job.processes[0].argv0.as_deref(), Some("codex.exe"));
+        assert!(job.processes[0].cmdline.is_none());
+    }
+
+    #[test]
+    fn windows_foreground_selection_cache_prunes_unused_entries_on_insertion() {
+        let first_snapshot = super::ProcessSnapshot::new(vec![
+            test_entry(10, 1, "powershell.exe", &["powershell.exe"]),
+            test_entry(20, 10, "codex.exe", &["codex.exe"]),
+        ]);
+        let first_job = super::foreground_job_from_entry(first_snapshot.entry(20).unwrap());
+        let mut cache = super::ForegroundSelectionCache::default();
+        cache.remember_for_test(10, &first_snapshot, &first_job);
+        cache.entries.get_mut(&10).unwrap().last_used = Instant::now()
+            .checked_sub(super::FOREGROUND_SELECTION_CACHE_RETENTION + Duration::from_secs(1))
+            .unwrap();
+
+        let second_snapshot = super::ProcessSnapshot::new(vec![
+            test_entry(11, 1, "powershell.exe", &["powershell.exe"]),
+            test_entry(21, 11, "claude.exe", &["claude.exe"]),
+        ]);
+        let second_job = super::foreground_job_from_entry(second_snapshot.entry(21).unwrap());
+        cache.remember_for_test(11, &second_snapshot, &second_job);
+
+        assert!(!cache.entries.contains_key(&10));
+        assert!(cache.entries.contains_key(&11));
+    }
+
+    #[test]
+    fn windows_foreground_selection_cache_retains_idle_native_shell_until_launch_or_exit() {
+        for name in ["cmd.exe", "powershell.exe", "PWSH.EXE"] {
+            let snapshot = super::ProcessSnapshot::new(vec![test_entry(10, 1, name, &[name])]);
+            let shell = super::foreground_job_from_entry(snapshot.entry(10).unwrap());
+            let mut cache = super::ForegroundSelectionCache::default();
+            cache.remember_for_test(10, &snapshot, &shell);
+            assert_eq!(cache.get(10, &snapshot), Some(shell.clone()));
+
+            let launched = super::ProcessSnapshot::new(vec![
+                test_entry(10, 1, name, &[name]),
+                test_entry(20, 10, "codex.exe", &["codex.exe"]),
+            ]);
+            assert_eq!(cache.get(10, &launched), None);
+            let agent = super::select_pane_foreground_job_from_snapshot_with_runtime_inspection(
+                10,
+                &launched,
+                |_| panic!("direct child must bypass escaped-agent inspection"),
+                |_| panic!("direct child must bypass runtime markers"),
+            )
+            .unwrap();
+            assert_eq!(agent.process_group_id, 20);
+            cache.remember_for_test(10, &launched, &agent);
+            assert_eq!(cache.get(10, &snapshot), None);
+
+            cache.remember_for_test(10, &snapshot, &shell);
+            assert_eq!(cache.get(10, &snapshot), Some(shell.clone()));
+            let short_lived_child = super::ProcessSnapshot::new(vec![
+                test_entry(10, 1, name, &[name]),
+                test_entry(21, 10, "git.exe", &["git.exe"]),
+            ]);
+            assert_eq!(cache.get(10, &short_lived_child), None);
+            cache.remember_for_test(10, &snapshot, &shell);
+            cache.entries.get_mut(&10).unwrap().shell_identity = super::ProcessIdentity::Stub {
+                running: false,
+                creation_time: None,
+            };
+            // An identical fresh signature must not hide shell exit/PID reuse.
+            assert_eq!(cache.get(10, &snapshot), None);
+
+            cache.remember_for_test(10, &snapshot, &shell);
+            cache.entries.get_mut(&10).unwrap().verified_at = Instant::now()
+                .checked_sub(super::FOREGROUND_SELECTION_RECHECK + Duration::from_secs(1))
+                .unwrap();
+            assert_eq!(cache.get(10, &snapshot), None);
+        }
+    }
+
+    #[test]
+    fn windows_foreground_selection_cache_keeps_escaped_and_unknown_children_fresh() {
+        for entries in [
+            vec![test_entry(10, 1, "bash.exe", &["bash.exe"])],
+            vec![test_entry(10, 1, "launcher.exe", &["launcher.exe"])],
+            vec![
+                test_entry(10, 1, "pwsh.exe", &["pwsh.exe"]),
+                test_entry(20, 10, "node.exe", &["node.exe", "worker.js"]),
+            ],
+        ] {
+            let snapshot = super::ProcessSnapshot::new(entries);
+            let shell = super::foreground_job_from_entry(snapshot.entry(10).unwrap());
+            let mut cache = super::ForegroundSelectionCache::default();
+            cache.remember_for_test(10, &snapshot, &shell);
+            assert_eq!(cache.get(10, &snapshot), None);
+        }
+    }
+
+    #[test]
+    fn windows_foreground_selection_cache_retains_live_escaped_agent() {
+        let snapshot = super::ProcessSnapshot::new(vec![
+            test_entry(10, 1, "bash.exe", &["bash.exe"]),
+            test_entry(20, 99, "launcher.exe", &["codex.exe"]),
+        ]);
+        let escaped = super::foreground_job_from_entry(snapshot.entry(20).unwrap());
+        let mut cache = super::ForegroundSelectionCache::default();
+
+        cache.remember_for_test(10, &snapshot, &escaped);
+
+        assert_eq!(cache.get(10, &snapshot), Some(escaped.clone()));
+        cache.entries.get_mut(&10).unwrap().selected_identity = super::ProcessIdentity::Stub {
+            running: false,
+            creation_time: None,
+        };
+        assert_eq!(cache.get(10, &snapshot), None);
     }
 
     #[test]
@@ -2626,19 +5119,25 @@ mod tests {
 
     #[test]
     fn windows_shell_is_available_only_without_descendants() {
-        let shell_only = vec![test_entry(10, 1, "powershell.exe", &["powershell.exe"])];
+        let shell_only = super::ProcessSnapshot::new(vec![test_entry(
+            10,
+            1,
+            "powershell.exe",
+            &["powershell.exe"],
+        )]);
         assert_eq!(
             super::available_pane_shell_from_snapshot(10, &shell_only).as_deref(),
             Some("powershell.exe")
         );
 
-        let busy = vec![
+        let busy = super::ProcessSnapshot::new(vec![
             test_entry(10, 1, "powershell.exe", &["powershell.exe"]),
             test_entry(20, 10, "git.exe", &["git.exe", "status"]),
-        ];
+        ]);
         assert_eq!(super::available_pane_shell_from_snapshot(10, &busy), None);
 
-        let replaced = vec![test_entry(10, 1, "vim.exe", &["vim.exe"])];
+        let replaced =
+            super::ProcessSnapshot::new(vec![test_entry(10, 1, "vim.exe", &["vim.exe"])]);
         assert_eq!(
             super::available_pane_shell_from_snapshot(10, &replaced),
             None
@@ -2668,7 +5167,8 @@ mod tests {
             test_entry(40, 1, "unrelated.exe", &["unrelated.exe"]),
         ];
 
-        let mut pids = super::session_processes_from_entries(10, &entries);
+        let snapshot = super::ProcessSnapshot::new(entries);
+        let mut pids = super::session_processes_from_snapshot(10, &snapshot);
         pids.sort_unstable();
 
         assert_eq!(pids, vec![10, 20, 30]);
@@ -2682,7 +5182,8 @@ mod tests {
             test_entry(30, 20, "node.exe", &["node.exe"]),
         ];
 
-        let descendants = super::descendant_entries(10, &entries);
+        let snapshot = super::ProcessSnapshot::new(entries);
+        let descendants = super::descendant_entries(10, &snapshot);
 
         assert_eq!(
             descendants
@@ -2739,13 +5240,52 @@ mod tests {
         name: &str,
         argv: &[&str],
     ) -> super::WindowsProcessEntry {
+        test_entry_with_creation_time(pid, parent_pid, name, argv, None)
+    }
+
+    fn test_entry_without_cmdline(
+        pid: u32,
+        parent_pid: u32,
+        name: &str,
+        creation_time: u64,
+    ) -> super::WindowsProcessEntry {
+        let command = super::OnceLock::new();
+        command
+            .set(super::WindowsProcessCommand::from_cmdline(
+                name,
+                Some(creation_time),
+                None,
+            ))
+            .unwrap();
         super::WindowsProcessEntry {
             pid,
             parent_pid,
             name: name.to_string(),
-            argv0: argv.first().map(|value| (*value).to_string()),
-            argv: Some(argv.iter().map(|value| (*value).to_string()).collect()),
-            cmdline: Some(argv.join(" ")),
+            command,
+        }
+    }
+
+    fn test_entry_with_creation_time(
+        pid: u32,
+        parent_pid: u32,
+        name: &str,
+        argv: &[&str],
+        creation_time: Option<u64>,
+    ) -> super::WindowsProcessEntry {
+        let command = super::OnceLock::new();
+        command
+            .set(super::WindowsProcessCommand {
+                creation_time,
+                argv0: argv.first().map(|value| (*value).to_string()),
+                argv: Some(argv.iter().map(|value| (*value).to_string()).collect()),
+                cmdline: Some(argv.join(" ")),
+            })
+            .unwrap();
+        super::WindowsProcessEntry {
+            pid,
+            parent_pid,
+            name: name.to_string(),
+            command,
         }
     }
 

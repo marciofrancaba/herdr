@@ -84,6 +84,11 @@ pub enum Node {
 pub struct TileLayout {
     root: Node,
     focus: PaneId,
+    /// Pane focused before `focus`, used by `close_focused`. Only a real focus
+    /// move writes it; tree edits go through the target-taking primitives
+    /// (`split_pane`, `close_pane`, unfocused `insert_pane_near`) so internal
+    /// focus excursions never corrupt it.
+    prev_focus: Option<PaneId>,
 }
 
 impl TileLayout {
@@ -95,9 +100,18 @@ impl TileLayout {
             Self {
                 root: Node::Pane(root_id),
                 focus: root_id,
+                prev_focus: None,
             },
             root_id,
         )
+    }
+
+    /// Move focus, recording the pane being left. No-op when focus is unchanged.
+    fn set_focus(&mut self, id: PaneId) {
+        if id != self.focus {
+            self.prev_focus = Some(self.focus);
+            self.focus = id;
+        }
     }
 
     pub fn focused(&self) -> PaneId {
@@ -115,53 +129,98 @@ impl TileLayout {
         result
     }
 
+    /// Compute pane rects as they will be after splitting `target`, without
+    /// changing the layout. Returns the rects and the new pane's index; the
+    /// new pane's entry carries `target`'s id.
+    pub fn panes_after_split(
+        &self,
+        area: Rect,
+        target: PaneId,
+        direction: Direction,
+        ratio: f32,
+    ) -> Option<(Vec<PaneInfo>, usize)> {
+        let mut panes = self.panes(area);
+        let index = panes.iter().position(|info| info.id == target)?;
+        let (first, second) = split_rect(panes[index].rect, direction, valid_split_ratio(ratio));
+        panes[index].rect = first;
+        panes[index].inner_rect = first;
+        let mut new_pane = panes[index].clone();
+        new_pane.rect = second;
+        new_pane.inner_rect = second;
+        new_pane.is_focused = false;
+        panes.insert(index + 1, new_pane);
+        Some((panes, index + 1))
+    }
+
     /// Collect all split boundaries for mouse drag resize.
     pub fn splits(&self, area: Rect) -> Vec<SplitBorder> {
         let mut result = Vec::new();
-        collect_splits(&self.root, area, vec![], &mut result);
+        collect_splits(&self.root, area, &mut Vec::new(), &mut result);
         result
     }
 
-    /// Split the focused pane. Returns the new pane's id.
+    /// Split the focused pane. Returns the new pane's id. Production splits
+    /// flow through `Tab` so a failed runtime spawn can roll back; this remains
+    /// as the user-split shape for tests.
+    #[cfg(test)]
     pub fn split_focused(&mut self, direction: Direction) -> PaneId {
         self.split_focused_with_ratio(direction, 0.5)
     }
 
     /// Split the focused pane with a custom first-child ratio.
+    #[cfg(test)]
     pub fn split_focused_with_ratio(&mut self, direction: Direction, ratio: f32) -> PaneId {
-        let new_id = PaneId::alloc();
-        let placeholder = PaneId::from_raw(0);
-        let old = std::mem::replace(&mut self.root, Node::Pane(placeholder));
-        self.root = split_at(old, self.focus, direction, new_id, valid_split_ratio(ratio));
-        self.focus = new_id;
+        let new_id = self
+            .split_pane(self.focus, direction, ratio)
+            .expect("focused pane is in the layout");
+        self.set_focus(new_id);
         new_id
     }
 
+    /// Split `target` without moving focus. Returns the new pane's id, or None
+    /// when `target` is not in the layout.
+    pub fn split_pane(
+        &mut self,
+        target: PaneId,
+        direction: Direction,
+        ratio: f32,
+    ) -> Option<PaneId> {
+        let node = find_pane_mut(&mut self.root, target)?;
+        let new_id = PaneId::alloc();
+        *node = split_node(target, direction, new_id, valid_split_ratio(ratio));
+        Some(new_id)
+    }
+
     /// Insert an existing pane id next to a target pane without allocating a new
-    /// pane or spawning a terminal runtime.
+    /// pane or spawning a terminal runtime. When `focus` is false, focus and its
+    /// history are left untouched.
     pub fn insert_pane_near(
         &mut self,
         target: PaneId,
         moved: PaneId,
         direction: Direction,
         ratio: f32,
+        focus: bool,
     ) -> bool {
         if target == moved {
             return false;
         }
         let ids = self.pane_ids();
-        if !ids.contains(&target) || ids.contains(&moved) {
+        if ids.contains(&moved) {
             return false;
         }
-
-        let placeholder = PaneId::from_raw(0);
-        let old = std::mem::replace(&mut self.root, Node::Pane(placeholder));
-        self.root = split_at(old, target, direction, moved, valid_split_ratio(ratio));
-        self.focus = moved;
+        let Some(node) = find_pane_mut(&mut self.root, target) else {
+            return false;
+        };
+        *node = split_node(target, direction, moved, valid_split_ratio(ratio));
+        if focus {
+            self.set_focus(moved);
+        }
         true
     }
 
-    /// Close the focused pane. Returns false if it's the last pane.
+    /// Close the focused pane, returning focus to the pane it came from when
+    /// that pane is still open. Returns false if it's the last pane.
     pub fn close_focused(&mut self) -> bool {
         if self.pane_count() <= 1 {
             return false;
@@ -169,25 +228,51 @@ impl TileLayout {
         let target = self.focus;
         let ids = self.pane_ids();
         let pos = ids.iter().position(|id| *id == target).unwrap();
-        let new_focus = if pos + 1 < ids.len() {
+        let ordered = if pos + 1 < ids.len() {
             ids[pos + 1]
         } else {
             ids[pos - 1]
+        };
+        let new_focus = match self.prev_focus {
+            Some(prev) if prev != target && ids.contains(&prev) => prev,
+            _ => ordered,
         };
         let placeholder = PaneId::from_raw(0);
         let old = std::mem::replace(&mut self.root, Node::Pane(placeholder));
         if let Some(new_root) = remove_pane(old, target) {
             self.root = new_root;
             self.focus = new_focus;
+            self.prev_focus = None;
             true
         } else {
             false
         }
     }
 
+    /// Close any pane. Focus and its history are left alone unless the closed
+    /// pane is the focused one.
+    pub fn close_pane(&mut self, id: PaneId) -> bool {
+        if self.focus == id {
+            return self.close_focused();
+        }
+        if self.pane_count() <= 1 || !self.pane_ids().contains(&id) {
+            return false;
+        }
+        let placeholder = PaneId::from_raw(0);
+        let old = std::mem::replace(&mut self.root, Node::Pane(placeholder));
+        let Some(new_root) = remove_pane(old, id) else {
+            return false;
+        };
+        self.root = new_root;
+        if self.prev_focus == Some(id) {
+            self.prev_focus = None;
+        }
+        true
+    }
+
     pub fn focus_pane(&mut self, id: PaneId) {
         if self.pane_ids().contains(&id) {
-            self.focus = id;
+            self.set_focus(id);
         }
     }
 
@@ -270,7 +355,11 @@ impl TileLayout {
     /// Reconstruct a layout from a saved tree.
     /// Reconstruct a layout from a saved tree.
     pub fn from_saved(root: Node, focus: PaneId) -> Self {
-        Self { root, focus }
+        Self {
+            root,
+            focus,
+            prev_focus: None,
+        }
     }
 }
 
@@ -436,7 +525,7 @@ fn collect_panes(node: &Node, area: Rect, focus: PaneId, result: &mut Vec<PaneIn
     }
 }
 
-fn collect_splits(node: &Node, area: Rect, path: Vec<bool>, result: &mut Vec<SplitBorder>) {
+fn collect_splits(node: &Node, area: Rect, path: &mut Vec<bool>, result: &mut Vec<SplitBorder>) {
     if let Node::Split {
         direction,
         ratio,
@@ -456,12 +545,12 @@ fn collect_splits(node: &Node, area: Rect, path: Vec<bool>, result: &mut Vec<Spl
             area,
             path: path.clone(),
         });
-        let mut lp = path.clone();
-        lp.push(false);
-        collect_splits(first, a, lp, result);
-        let mut rp = path;
-        rp.push(true);
-        collect_splits(second, b, rp, result);
+        path.push(false);
+        collect_splits(first, a, path, result);
+        path.pop();
+        path.push(true);
+        collect_splits(second, b, path, result);
+        path.pop();
     }
 }
 
@@ -517,36 +606,26 @@ fn swap_pane_ids(node: &mut Node, first: PaneId, second: PaneId) {
     }
 }
 
-fn split_at(
-    node: Node,
-    target: PaneId,
-    direction: Direction,
-    new_id: PaneId,
-    split_ratio: f32,
-) -> Node {
+fn find_pane_mut(node: &mut Node, target: PaneId) -> Option<&mut Node> {
     match node {
-        Node::Pane(id) if id == target => Node::Split {
-            direction,
-            ratio: split_ratio,
-            first: Box::new(Node::Pane(id)),
-            second: Box::new(Node::Pane(new_id)),
-        },
-        Node::Pane(_) => node,
-        Node::Split {
-            direction: d,
-            ratio,
-            first,
-            second,
-        } => Node::Split {
-            direction: d,
-            ratio,
-            first: Box::new(split_at(*first, target, direction, new_id, split_ratio)),
-            second: Box::new(split_at(*second, target, direction, new_id, split_ratio)),
-        },
+        Node::Pane(id) if *id == target => Some(node),
+        Node::Pane(_) => None,
+        Node::Split { first, second, .. } => {
+            find_pane_mut(first, target).or_else(|| find_pane_mut(second, target))
+        }
     }
 }
 
-fn valid_split_ratio(ratio: f32) -> f32 {
+fn split_node(target: PaneId, direction: Direction, new_id: PaneId, split_ratio: f32) -> Node {
+    Node::Split {
+        direction,
+        ratio: split_ratio,
+        first: Box::new(Node::Pane(target)),
+        second: Box::new(Node::Pane(new_id)),
+    }
+}
+
+pub(crate) fn valid_split_ratio(ratio: f32) -> f32 {
     if ratio.is_finite() {
         ratio.clamp(0.1, 0.9)
     } else {
@@ -642,6 +721,178 @@ fn split_rect(area: Rect, direction: Direction, ratio: f32) -> (Rect, Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn split_paths_preserve_preorder_geometry_and_resize_targets() {
+        let ids = [
+            PaneId::alloc(),
+            PaneId::alloc(),
+            PaneId::alloc(),
+            PaneId::alloc(),
+        ];
+        let mut layout = TileLayout::from_saved(
+            Node::Split {
+                direction: Direction::Horizontal,
+                ratio: 0.5,
+                first: Box::new(split_node(ids[0], Direction::Vertical, ids[1], 0.5)),
+                second: Box::new(split_node(ids[2], Direction::Vertical, ids[3], 0.25)),
+            },
+            ids[0],
+        );
+        let area = Rect::new(3, 7, 120, 80);
+        let splits = layout.splits(area);
+        assert_eq!(splits.len(), 3);
+        for (split, (path, direction, pos, rect)) in splits.iter().zip([
+            (vec![], Direction::Horizontal, 63, area),
+            (
+                vec![false],
+                Direction::Vertical,
+                47,
+                Rect::new(3, 7, 60, 80),
+            ),
+            (
+                vec![true],
+                Direction::Vertical,
+                27,
+                Rect::new(63, 7, 60, 80),
+            ),
+        ]) {
+            assert_eq!(
+                (split.path.clone(), split.direction, split.pos, split.area),
+                (path, direction, pos, rect)
+            );
+        }
+        assert!(layout.set_ratio_at(&splits[2].path, 0.5));
+        let resized = layout.splits(area);
+        assert_eq!(resized[1].pos, splits[1].pos);
+        assert_eq!(resized[2].pos, 47);
+    }
+
+    #[test]
+    fn rejected_splits_and_insertions_preserve_layout_and_focus_history() {
+        let (mut layout, root) = TileLayout::new();
+        let second = layout.split_focused(Direction::Horizontal);
+        let absent = PaneId::alloc();
+        let before = pane_rects(&layout);
+        let splits = split_snapshot(&layout);
+        assert!(layout
+            .split_pane(absent, Direction::Vertical, 0.5)
+            .is_none());
+        for (target, moved) in [(absent, PaneId::alloc()), (root, second), (root, root)] {
+            assert!(!layout.insert_pane_near(target, moved, Direction::Vertical, 0.3, true));
+        }
+        assert_eq!(pane_rects(&layout), before);
+        assert_eq!(split_snapshot(&layout), splits);
+        assert_eq!(layout.focused(), second);
+        assert_eq!(layout.prev_focus, Some(root));
+        assert!(layout.close_focused());
+        assert_eq!(layout.focused(), root);
+    }
+
+    #[test]
+    fn splitting_a_deep_leaf_preserves_other_branches_and_focus() {
+        let (mut layout, root) = TileLayout::new();
+        let right = layout.split_pane(root, Direction::Horizontal, 0.6).unwrap();
+        let bottom_left = layout.split_pane(root, Direction::Vertical, 0.4).unwrap();
+        let right_rect = pane_rect(&layout, right);
+        let focus = layout.focused();
+        let new = layout
+            .split_pane(bottom_left, Direction::Horizontal, f32::NAN)
+            .unwrap();
+        assert_eq!(layout.pane_ids(), [root, bottom_left, new, right]);
+        assert_eq!(pane_rect(&layout, right), right_rect);
+        assert_eq!(layout.focused(), focus);
+        assert_eq!(
+            split_snapshot(&layout),
+            [
+                (Direction::Horizontal, 0.6),
+                (Direction::Vertical, 0.4),
+                (Direction::Horizontal, 0.5)
+            ]
+        );
+    }
+
+    #[test]
+    fn panes_after_split_predicts_the_real_split_geometry() {
+        let area = Rect::new(3, 1, 121, 37);
+        let (mut layout, root) = TileLayout::new();
+        let right = layout.split_pane(root, Direction::Horizontal, 0.6).unwrap();
+        let bottom_left = layout.split_pane(root, Direction::Vertical, 0.4).unwrap();
+        for (target, direction, ratio) in [
+            (bottom_left, Direction::Horizontal, 0.5),
+            (right, Direction::Vertical, 0.3),
+            (root, Direction::Horizontal, f32::NAN),
+        ] {
+            let (predicted, new_index) = layout
+                .panes_after_split(area, target, direction, ratio)
+                .unwrap();
+            let new_id = layout.split_pane(target, direction, ratio).unwrap();
+            let actual: Vec<_> = layout
+                .panes(area)
+                .into_iter()
+                .map(|info| info.rect)
+                .collect();
+            assert_eq!(
+                predicted.iter().map(|info| info.rect).collect::<Vec<_>>(),
+                actual
+            );
+            assert_eq!(layout.pane_ids()[new_index], new_id);
+        }
+        assert!(layout
+            .panes_after_split(area, PaneId::alloc(), Direction::Vertical, 0.5)
+            .is_none());
+    }
+
+    #[test]
+    #[ignore = "manual BSP allocation and traversal scaling profile"]
+    fn bsp_layout_profile() {
+        use std::hint::black_box;
+        use std::time::{Duration, Instant};
+        fn build(count: usize, balanced: bool) -> TileLayout {
+            let (mut layout, root) = TileLayout::new();
+            let mut leaves = std::collections::VecDeque::from([root]);
+            for _ in 1..count {
+                let target = leaves.pop_front().unwrap();
+                let new = layout
+                    .split_pane(target, Direction::Horizontal, 0.5)
+                    .unwrap();
+                if balanced {
+                    leaves.push_back(target);
+                }
+                leaves.push_back(new);
+            }
+            layout
+        }
+        fn measure(mut operation: impl FnMut()) -> f64 {
+            for _ in 0..32 {
+                operation();
+            }
+            let mut samples = Vec::new();
+            for _ in 0..7 {
+                let start = Instant::now();
+                let mut iterations = 0;
+                while start.elapsed() < Duration::from_millis(20) {
+                    operation();
+                    iterations += 1;
+                }
+                samples.push(start.elapsed().as_secs_f64() * 1e6 / f64::from(iterations));
+            }
+            samples.sort_by(f64::total_cmp);
+            samples[3]
+        }
+        for count in [1, 15, 128, 512] {
+            for balanced in [true, false] {
+                let layout = build(count, balanced);
+                let splits = measure(|| {
+                    black_box(layout.splits(Rect::new(0, 0, 120, 40)));
+                });
+                let build = measure(|| {
+                    black_box(build(count, balanced));
+                });
+                println!("bsp panes={count} balanced={balanced} splits_us={splits:.3} build_us={build:.3}");
+            }
+        }
+    }
 
     fn pane(id: u32) -> PaneId {
         PaneId::from_raw(id)
@@ -746,7 +997,7 @@ mod tests {
         let (mut layout, root) = TileLayout::new();
         let moved = pane(99);
 
-        assert!(layout.insert_pane_near(root, moved, Direction::Horizontal, 0.25));
+        assert!(layout.insert_pane_near(root, moved, Direction::Horizontal, 0.25, true));
 
         assert_eq!(layout.pane_count(), 2);
         assert_eq!(layout.pane_ids(), vec![root, moved]);
@@ -953,5 +1204,145 @@ mod tests {
             find_in_direction(&focused, NavDirection::Left, &panes),
             Some(pane(3))
         );
+    }
+
+    #[test]
+    fn close_focused_returns_to_the_pane_focus_came_from() {
+        let mut layout = sample_layout();
+        layout.focus_pane(pane(4));
+
+        assert!(layout.close_focused());
+
+        assert_eq!(layout.focused(), pane(2));
+    }
+
+    #[test]
+    fn close_focused_returns_to_the_pane_that_opened_a_split() {
+        // Allocated ids only: sample_layout() uses from_raw and shares the id
+        // space with the allocator.
+        let (mut layout, first) = TileLayout::new();
+        let second = layout.split_focused(Direction::Horizontal);
+        let third = layout.split_focused(Direction::Vertical);
+        assert_eq!(layout.pane_ids().len(), 3);
+
+        layout.focus_pane(first);
+        let opened = layout.split_focused(Direction::Horizontal);
+        assert_eq!(layout.focused(), opened);
+
+        assert!(layout.close_focused());
+
+        assert_eq!(layout.focused(), first);
+        assert!(layout.pane_ids().contains(&second));
+        assert!(layout.pane_ids().contains(&third));
+    }
+
+    #[test]
+    fn closing_a_background_pane_keeps_the_focused_pane_history() {
+        let mut layout = sample_layout();
+        layout.focus_pane(pane(4));
+
+        assert!(layout.close_pane(pane(1)));
+        assert_eq!(layout.focused(), pane(4));
+
+        assert!(layout.close_focused());
+        assert_eq!(layout.focused(), pane(2));
+    }
+
+    #[test]
+    fn closing_the_remembered_pane_drops_the_focus_history() {
+        let mut layout = sample_layout();
+        layout.focus_pane(pane(4));
+
+        assert!(layout.close_pane(pane(2)));
+
+        assert!(layout.close_focused());
+        assert_eq!(layout.focused(), pane(3));
+    }
+
+    #[test]
+    fn close_focused_uses_tree_order_without_focus_history() {
+        let mut layout = sample_layout();
+
+        assert!(layout.close_focused());
+
+        assert_eq!(layout.focused(), pane(3));
+    }
+
+    #[test]
+    fn close_focused_does_not_reuse_history_after_it_is_consumed() {
+        let mut layout = sample_layout();
+        layout.focus_pane(pane(4));
+
+        assert!(layout.close_focused());
+        assert_eq!(layout.focused(), pane(2));
+
+        assert!(layout.close_focused());
+        assert_eq!(layout.focused(), pane(3));
+    }
+
+    #[test]
+    fn resize_does_not_disturb_the_close_focus_target() {
+        let mut layout = sample_layout();
+        layout.focus_pane(pane(4));
+        layout.resize_pane(pane(1), NavDirection::Right, 0.05, Rect::new(0, 0, 100, 40));
+
+        assert!(layout.close_focused());
+
+        assert_eq!(layout.focused(), pane(2));
+    }
+
+    #[test]
+    fn split_pane_leaves_focus_and_history_untouched() {
+        let mut layout = sample_layout();
+        layout.focus_pane(pane(4));
+
+        let new_id = layout
+            .split_pane(pane(1), Direction::Horizontal, 0.5)
+            .expect("target exists");
+
+        assert!(layout.pane_ids().contains(&new_id));
+        assert_eq!(layout.focused(), pane(4));
+        assert!(layout.close_focused());
+        assert_eq!(layout.focused(), pane(2));
+    }
+
+    #[test]
+    fn split_pane_missing_target_changes_nothing() {
+        let mut layout = sample_layout();
+        let ids = layout.pane_ids();
+
+        assert_eq!(
+            layout.split_pane(pane(99), Direction::Horizontal, 0.5),
+            None
+        );
+
+        assert_eq!(layout.pane_ids(), ids);
+    }
+
+    #[test]
+    fn insert_pane_near_unfocused_keeps_focus_and_history() {
+        let mut layout = sample_layout();
+        layout.focus_pane(pane(4));
+
+        assert!(layout.insert_pane_near(pane(1), pane(9), Direction::Horizontal, 0.5, false));
+
+        assert_eq!(layout.focused(), pane(4));
+        assert!(layout.close_focused());
+        assert_eq!(layout.focused(), pane(2));
+    }
+
+    #[test]
+    fn failed_split_rollback_preserves_focus_history() {
+        let mut layout = sample_layout();
+        layout.focus_pane(pane(4));
+
+        let new_id = layout
+            .split_pane(layout.focused(), Direction::Horizontal, 0.5)
+            .expect("target exists");
+        assert!(layout.close_pane(new_id));
+
+        assert_eq!(layout.focused(), pane(4));
+        assert!(layout.close_focused());
+        assert_eq!(layout.focused(), pane(2));
     }
 }

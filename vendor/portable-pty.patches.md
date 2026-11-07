@@ -84,3 +84,93 @@ python3 -m unittest scripts.test_vendor_portable_pty
 ```
 
 On Windows, also run `cargo test raw_arg_appends_unescaped_windows_command_tail`.
+
+## 0003 reject malformed Windows environments
+
+status: active
+
+patch: `vendor/patches/portable-pty/0003-reject-malformed-windows-environments.patch`
+
+herdr issue: https://github.com/herdrdev/herdr/issues/3430
+
+upstream discussions:
+
+- https://github.com/wezterm/wezterm/issues/4364
+- https://github.com/warpdotdev/warp/commit/2992d02e3e38af697c83a3bd6f20003f54ffe066
+
+upstream pr: none
+
+vendored base: `portable-pty 0.9.0`
+
+local files:
+
+- `vendor/portable-pty/src/cmdbuilder.rs`
+
+reason: Windows process environments may contain a registry value with an
+empty name or a non-string type. `winreg 0.10` converts `REG_MULTI_SZ` to an
+`OsString` that can contain embedded nulls. `portable-pty` serialized those
+values unchanged, producing an invalid environment block that makes
+`CreateProcessW` fail with `ERROR_INVALID_PARAMETER` (87). Import only Windows
+environment string types and omit entries that cannot form one complete
+`name=value\0` record.
+
+remove when: upstream `portable-pty` both imports only valid Windows environment
+string types and prevents malformed names or values from corrupting the process
+environment block, or Herdr replaces this launch path.
+
+verification:
+
+```sh
+python3 -m unittest scripts.test_vendor_portable_pty
+```
+
+On Windows, also run:
+
+```sh
+cargo test --manifest-path vendor/portable-pty/Cargo.toml windows_environment_rejects_malformed_entries
+```
+
+## 0004 skip directories when resolving Windows programs
+
+status: active
+
+patch: `vendor/patches/portable-pty/0004-skip-directories-when-resolving-windows-programs.patch`
+
+herdr issue: https://github.com/herdrdev/herdr/issues/5267
+
+upstream discussion: none
+
+upstream pr: none
+
+vendored base: `portable-pty 0.9.0`
+
+local files:
+
+- `vendor/portable-pty/src/cmdbuilder.rs`
+
+reason: Windows `PATH` commonly contains a directory whose name matches a
+program, such as `C:\Windows\System32\PowerShell`. `search_path` returned that
+directory because `Path::exists()` is true for directories, so Herdr asked
+`CreateProcessW` to execute a directory and the pane failed to open with
+`Access is denied` (os error 5). Requiring `is_file()` for both the exact name
+and the PATHEXT candidates skips shadowing directories and finds the real
+executable, matching CreateProcessW's own `PATH` search.
+
+remove when: upstream `portable-pty` skips non-file `PATH` candidates, or Herdr
+replaces this launch path.
+
+verification:
+
+```sh
+python3 -m unittest scripts.test_vendor_portable_pty
+```
+
+On Windows, run the regression test against the vendored crate. It lives inside
+the Herdr workspace but is only a `[patch]` provider, not a workspace member, so
+build a standalone copy and mark it as its own workspace root:
+
+```sh
+cp -r vendor/portable-pty "$TMP/portable-pty"
+printf '\n[workspace]\n' >> "$TMP/portable-pty/Cargo.toml"
+cargo test --manifest-path "$TMP/portable-pty/Cargo.toml" windows_search_path_skips_directories
+```

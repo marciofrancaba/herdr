@@ -15,7 +15,10 @@ fn parse_kitty_key_sequence(data: &str) -> Option<TerminalKey> {
 
     let mut fields = body.split(';');
     let key_part = fields.next()?;
-    let modifier_part = fields.next().unwrap_or("1");
+    let modifier_part = fields
+        .next()
+        .filter(|field| !field.is_empty())
+        .unwrap_or("1");
     let associated_text = fields.next();
     if fields.next().is_some() {
         return None;
@@ -30,21 +33,132 @@ fn parse_kitty_key_sequence(data: &str) -> Option<TerminalKey> {
         .next()
         .filter(|field| !field.is_empty())
         .and_then(|field| field.parse::<u32>().ok());
+    let base_layout_codepoint = key_fields
+        .next()
+        .filter(|field| !field.is_empty())
+        .and_then(|field| field.parse::<u32>().ok());
 
-    if let Some(text) = associated_text {
-        if text.parse::<u32>().ok()? != codepoint {
-            return None;
+    let mut code = kitty_codepoint_to_keycode(codepoint)?;
+    // Control-code text only ever matches Enter/Backspace/Tab/Esc, never a
+    // character key, so it is checked against the reported key.
+    let associated_text = match associated_text {
+        Some(value) => match parse_kitty_associated_text(value) {
+            Some(text) => Some(text),
+            None if matching_control_associated_text(value, code) => None,
+            None => return None,
+        },
+        None => None,
+    };
+    // Ctrl chords on a non-Latin layout (Ctrl+\u{441} on Russian) are shortcuts
+    // for the physical key the host names in the base-layout field: Ctrl+C.
+    // Ghostty sends ^C to a plain shell for them, and the Kitty spec tells apps
+    // to match shortcuts on that key. Only what Ghostty maps is rewritten: Ctrl
+    // alone, on a key with a control byte. Shift, Alt and Super chords keep the
+    // layout character, Ctrl+Alt may be AltGr typing it, and Latin layouts
+    // (\u{f6}, \u{131}, \u{e5}) keep their own keys.
+    let mut shifted_codepoint = shifted_codepoint;
+    let mut layout_key = None;
+    if let (KeyCode::Char(ch), Some(base)) = (code, base_layout_codepoint.and_then(char::from_u32))
+    {
+        // A shifted alternate means Shift was held, even if the modifier
+        // field leaves it out (normalized below).
+        let shifted = shifted_codepoint.is_some_and(|shifted| shifted != codepoint);
+        if key_modifiers_from_u8(modifier) == KeyModifiers::CONTROL
+            && !shifted
+            && is_non_latin_script(ch)
+            && ghostty_maps_ctrl_to_physical_key(base)
+            && associated_text.is_none()
+        {
+            layout_key = Some(ch);
+            code = KeyCode::Char(base);
+            // The shifted alternate belongs to the layout character.
+            shifted_codepoint = None;
         }
     }
-
-    let code = kitty_codepoint_to_keycode(codepoint)?;
     let kind = parse_kitty_event_type(event_type)?;
+    let mut modifiers = key_modifiers_from_u8(modifier);
+    // Kitty permits the shifted alternate only while Shift is active. Normalize
+    // contradictory reports here so they cannot dispatch an unshifted command.
+    if matches!(code, KeyCode::Char(_))
+        && shifted_codepoint
+            .is_some_and(|shifted| shifted != codepoint && char::from_u32(shifted).is_some())
+    {
+        modifiers |= KeyModifiers::SHIFT;
+    }
 
-    let mut key = TerminalKey::new(code, key_modifiers_from_u8(modifier)).with_kind(kind);
+    let mut key = TerminalKey::new(code, modifiers)
+        .with_kind(kind)
+        .with_layout_key(layout_key);
     if let Some(shifted_codepoint) = shifted_codepoint {
         key = key.with_shifted_codepoint(shifted_codepoint);
     }
-    Some(key)
+    Some(key.with_generated_text(associated_text))
+}
+
+/// Physical keys Ghostty sends a control byte for when Ctrl is held on a
+/// non-Latin layout. Ctrl+I, Ctrl+M and Ctrl+[ are left out on purpose
+/// (fixterms), so Ctrl+\u{448} is not Tab and Ctrl+\u{445} is not Esc.
+fn ghostty_maps_ctrl_to_physical_key(base: char) -> bool {
+    matches!(base, 'a'..='z' | '0'..='9' | '/' | '\\' | ']') && !matches!(base, 'i' | 'm')
+}
+
+/// Scripts whose layouts put their own letters on the US letter keys, so a
+/// Ctrl chord names the physical key. Latin scripts are excluded: their keys
+/// are shortcuts of their own (Ctrl+\u{f6} is not Ctrl+;).
+fn is_non_latin_script(ch: char) -> bool {
+    matches!(
+        u32::from(ch),
+        0x0370..=0x03FF // Greek
+            | 0x0400..=0x052F // Cyrillic and supplement
+            | 0x0530..=0x058F // Armenian
+            | 0x0590..=0x05FF // Hebrew
+            | 0x0600..=0x06FF // Arabic
+            | 0x0700..=0x07FF // Syriac, Arabic supplement, Thaana, NKo
+            | 0x08A0..=0x08FF // Arabic extended-A
+            | 0x0900..=0x0DFF // Indic scripts through Sinhala
+            | 0x0E00..=0x0EFF // Thai, Lao
+            | 0x0F00..=0x0FFF // Tibetan
+            | 0x1000..=0x109F // Myanmar
+            | 0x10A0..=0x10FF // Georgian
+            | 0x1100..=0x11FF // Hangul Jamo
+            | 0x1200..=0x18FF // Ethiopic, Cherokee, Canadian Syllabics, Khmer, Mongolian
+            | 0x1C80..=0x1C8F // Cyrillic extended-C
+            | 0x1C90..=0x1CBF // Georgian extended
+            | 0x1F00..=0x1FFF // Greek extended
+            | 0x2DE0..=0x2DFF // Cyrillic extended-A
+            | 0x3040..=0x30FF // Hiragana, Katakana
+            | 0x3100..=0x318F // Bopomofo, Hangul compatibility Jamo
+            | 0x3400..=0x4DBF // CJK extension A
+            | 0x4E00..=0x9FFF // CJK unified ideographs
+            | 0xA640..=0xA69F // Cyrillic extended-B
+            | 0xAB70..=0xABBF // Cherokee supplement (lowercase)
+            | 0xAC00..=0xD7AF // Hangul syllables
+    )
+}
+
+fn parse_kitty_associated_text(value: &str) -> Option<String> {
+    let mut text = String::new();
+    for codepoint in value.split(':') {
+        let ch = char::from_u32(codepoint.parse::<u32>().ok()?)?;
+        if ch.is_control() {
+            return None;
+        }
+        text.push(ch);
+    }
+    (!text.is_empty()).then_some(text)
+}
+
+// WezTerm can attach the matching legacy control code in report-all mode even
+// though the Kitty protocol forbids control characters in associated text.
+// Keep the unambiguous key event, but never expose that field as generated text.
+fn matching_control_associated_text(value: &str, code: KeyCode) -> bool {
+    matches!(
+        (code, value),
+        (KeyCode::Enter, "13")
+            | (KeyCode::Backspace, "8")
+            | (KeyCode::Tab, "9")
+            | (KeyCode::Esc, "27")
+    )
 }
 
 #[allow(dead_code)] // Reserved for the upcoming raw stdin parser.
@@ -78,12 +192,9 @@ fn parse_legacy_key_sequence(data: &str) -> Option<TerminalKey> {
         _ if data.starts_with('\x1b') => {
             let rest = data.strip_prefix('\x1b')?;
             if rest.chars().count() == 1 {
-                let ch = rest.chars().next()?;
-                let mut modifiers = KeyModifiers::ALT;
-                if ch.is_ascii_uppercase() {
-                    modifiers |= KeyModifiers::SHIFT;
-                }
-                Some(TerminalKey::new(KeyCode::Char(ch), modifiers))
+                let mut key = parse_legacy_key_sequence(rest)?;
+                key.modifiers |= KeyModifiers::ALT;
+                Some(key)
             } else {
                 None
             }
@@ -161,10 +272,18 @@ fn parse_legacy_special_sequence(data: &str) -> Option<TerminalKey> {
         "\x1bOj" => Some(TerminalKey::new(KeyCode::Char('*'), KeyModifiers::empty())),
         "\x1bOo" => Some(TerminalKey::new(KeyCode::Char('/'), KeyModifiers::empty())),
         "\x1bOM" => Some(TerminalKey::new(KeyCode::Enter, KeyModifiers::empty())),
-        "\x1bOP" | "\x1b[11~" => Some(TerminalKey::new(KeyCode::F(1), KeyModifiers::empty())),
-        "\x1bOQ" | "\x1b[12~" => Some(TerminalKey::new(KeyCode::F(2), KeyModifiers::empty())),
+        // Kitty keyboard hosts send unmodified F1, F2 and F4 as bare `CSI P/Q/S`
+        // (#4403). F3 stays `CSI 13~` there: a bare `CSI R` is a cursor report.
+        "\x1bOP" | "\x1b[11~" | "\x1b[P" => {
+            Some(TerminalKey::new(KeyCode::F(1), KeyModifiers::empty()))
+        }
+        "\x1bOQ" | "\x1b[12~" | "\x1b[Q" => {
+            Some(TerminalKey::new(KeyCode::F(2), KeyModifiers::empty()))
+        }
         "\x1bOR" | "\x1b[13~" => Some(TerminalKey::new(KeyCode::F(3), KeyModifiers::empty())),
-        "\x1bOS" | "\x1b[14~" => Some(TerminalKey::new(KeyCode::F(4), KeyModifiers::empty())),
+        "\x1bOS" | "\x1b[14~" | "\x1b[S" => {
+            Some(TerminalKey::new(KeyCode::F(4), KeyModifiers::empty()))
+        }
         "\x1b[15~" => Some(TerminalKey::new(KeyCode::F(5), KeyModifiers::empty())),
         "\x1b[17~" => Some(TerminalKey::new(KeyCode::F(6), KeyModifiers::empty())),
         "\x1b[18~" => Some(TerminalKey::new(KeyCode::F(7), KeyModifiers::empty())),
@@ -185,7 +304,7 @@ fn parse_xterm_modified_special_sequence(data: &str) -> Option<TerminalKey> {
         let suffix_char = body.chars().last()?;
         if suffix_char.is_ascii_alphabetic() {
             let modifier_and_event = body.strip_suffix(suffix_char)?;
-            let (modifier_text, event_type) = split_modifier_and_event(modifier_and_event);
+            let (modifier_text, event_type) = split_xterm_modifier_and_event(modifier_and_event)?;
             let mod_value = modifier_text.parse::<u8>().ok()?.checked_sub(1)?;
             let code = match suffix_char {
                 'A' => KeyCode::Up,
@@ -209,13 +328,17 @@ fn parse_xterm_modified_special_sequence(data: &str) -> Option<TerminalKey> {
 
     let tilde_body = body.strip_suffix('~')?;
     let (code_part, modifier_part) = tilde_body.split_once(';')?;
-    let (modifier_text, event_type) = split_modifier_and_event(modifier_part);
+    let (modifier_text, event_type) = split_xterm_modifier_and_event(modifier_part)?;
     let mod_value = modifier_text.parse::<u8>().ok()?.checked_sub(1)?;
     let code = match code_part {
         "2" => KeyCode::Insert,
         "3" => KeyCode::Delete,
         "5" => KeyCode::PageUp,
         "6" => KeyCode::PageDown,
+        "11" => KeyCode::F(1),
+        "12" => KeyCode::F(2),
+        "13" => KeyCode::F(3),
+        "14" => KeyCode::F(4),
         "15" => KeyCode::F(5),
         "17" => KeyCode::F(6),
         "18" => KeyCode::F(7),
@@ -230,6 +353,19 @@ fn parse_xterm_modified_special_sequence(data: &str) -> Option<TerminalKey> {
         TerminalKey::new(code, key_modifiers_from_u8(mod_value))
             .with_kind(parse_kitty_event_type(event_type)?),
     )
+}
+
+fn split_xterm_modifier_and_event(input: &str) -> Option<(&str, Option<&str>)> {
+    let modifier_and_event =
+        if let Some((modifier_and_event, associated_text)) = input.split_once(';') {
+            // Alacritty on macOS reports Cocoa function-key markers as associated
+            // text. The sequence final already identifies the key, so ignore them.
+            parse_kitty_associated_text(associated_text)?;
+            modifier_and_event
+        } else {
+            input
+        };
+    Some(split_modifier_and_event(modifier_and_event))
 }
 
 fn split_modifier_and_event(input: &str) -> (&str, Option<&str>) {
@@ -262,6 +398,7 @@ fn kitty_codepoint_to_keycode(codepoint: u32) -> Option<KeyCode> {
         57361 => Some(KeyCode::PrintScreen),
         57362 => Some(KeyCode::Pause),
         57363 => Some(KeyCode::Menu),
+        57364..=57375 => Some(KeyCode::F((codepoint - 57364 + 1) as u8)),
         57376..=57398 => Some(KeyCode::F((codepoint - 57376 + 13) as u8)),
         57399 => Some(KeyCode::Char('0')),
         57400 => Some(KeyCode::Char('1')),
@@ -318,13 +455,8 @@ fn kitty_codepoint_to_keycode(codepoint: u32) -> Option<KeyCode> {
         57452 => Some(KeyCode::Modifier(ModifierKeyCode::RightMeta)),
         57453 => Some(KeyCode::Modifier(ModifierKeyCode::IsoLevel3Shift)),
         57454 => Some(KeyCode::Modifier(ModifierKeyCode::IsoLevel5Shift)),
-        value if is_kitty_functional_codepoint(value) => None,
         value => char::from_u32(value).map(KeyCode::Char),
     }
-}
-
-fn is_kitty_functional_codepoint(codepoint: u32) -> bool {
-    (57358..=57454).contains(&codepoint)
 }
 
 #[allow(dead_code)] // Reserved for the upcoming raw stdin parser.
@@ -356,7 +488,6 @@ mod tests {
     use crossterm::event::{KeyCode, KeyModifiers, ModifierKeyCode};
 
     use super::*;
-    use crate::input::{encode_terminal_key, KeyboardProtocol};
 
     fn assert_terminal_key_eq(
         actual: TerminalKey,
@@ -537,7 +668,21 @@ mod tests {
             crossterm::event::KeyEventKind::Press,
             None,
         );
-        assert_eq!(encode_terminal_key(key, KeyboardProtocol::Legacy), b"\x1bA");
+        assert_eq!(crate::pane::test_encode_key_for_app(b"", key), b"\x1bA");
+    }
+
+    #[test]
+    fn parse_legacy_alt_control_letter_composes_modifiers() {
+        let key = parse_terminal_key_sequence("\x1b\x06")
+            .expect("ctrl-alt-f legacy sequence should parse");
+        assert_terminal_key_eq(
+            key.clone(),
+            KeyCode::Char('f'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT,
+            crossterm::event::KeyEventKind::Press,
+            None,
+        );
+        assert_eq!(crate::pane::test_encode_key_for_app(b"", key), b"\x1b\x06");
     }
 
     #[test]
@@ -575,9 +720,31 @@ mod tests {
             crossterm::event::KeyEventKind::Press,
             None,
         );
-        assert_eq!(parse_terminal_key_sequence("\x1b[11;2~"), None);
-        assert_eq!(parse_terminal_key_sequence("\x1b[14;1~"), None);
-        assert_eq!(parse_terminal_key_sequence("\x1b[14;3~"), None);
+    }
+
+    #[test]
+    fn parse_parameterized_csi_tilde_f1_through_f4() {
+        // foot and some rxvt-style hosts emit F1-F4 as `CSI <code>;<mods>~`
+        // (for example F3 as `\x1b[13;1:1~`), reusing the same code table as the
+        // unmodified `\x1b[11~`..`\x1b[14~` forms.
+        let cases = [
+            ("\x1b[11;2~", KeyCode::F(1), KeyModifiers::SHIFT),
+            ("\x1b[12;1~", KeyCode::F(2), KeyModifiers::empty()),
+            ("\x1b[13;1:1~", KeyCode::F(3), KeyModifiers::empty()),
+            ("\x1b[13;2~", KeyCode::F(3), KeyModifiers::SHIFT),
+            ("\x1b[14;3~", KeyCode::F(4), KeyModifiers::ALT),
+        ];
+
+        for (sequence, code, modifiers) in cases {
+            let parsed = parse_terminal_key_sequence(sequence).unwrap();
+            assert_terminal_key_eq(
+                parsed,
+                code,
+                modifiers,
+                crossterm::event::KeyEventKind::Press,
+                None,
+            );
+        }
     }
 
     #[test]
@@ -596,6 +763,30 @@ mod tests {
         assert_eq!(key.modifiers, KeyModifiers::SHIFT);
         assert_eq!(key.kind, crossterm::event::KeyEventKind::Release);
         assert_eq!(key.shifted_codepoint, Some('L' as u32));
+    }
+
+    #[test]
+    fn parse_kitty_sequence_recovers_omitted_shift_modifier() {
+        for (sequence, kind) in [
+            ("\x1b[114:82;1u", crossterm::event::KeyEventKind::Press),
+            ("\x1b[114:82;1:2u", crossterm::event::KeyEventKind::Repeat),
+            ("\x1b[114:82;1:3u", crossterm::event::KeyEventKind::Release),
+        ] {
+            let key = parse_terminal_key_sequence(sequence).unwrap();
+            assert_eq!(key.code, KeyCode::Char('r'));
+            assert_eq!(key.modifiers, KeyModifiers::SHIFT);
+            assert_eq!(key.kind, kind);
+            assert_eq!(key.shifted_codepoint, Some('R' as u32));
+        }
+    }
+
+    #[test]
+    fn parse_kitty_sequence_does_not_infer_shift_without_distinct_shifted_alternate() {
+        for sequence in ["\x1b[114;1u", "\x1b[114:114;1u", "\x1b[114::113;1u"] {
+            let key = parse_terminal_key_sequence(sequence).unwrap();
+            assert_eq!(key.code, KeyCode::Char('r'));
+            assert_eq!(key.modifiers, KeyModifiers::empty());
+        }
     }
 
     #[test]
@@ -624,15 +815,212 @@ mod tests {
             crossterm::event::KeyEventKind::Press,
             None,
         );
+        assert_eq!(key.generated_text.as_deref(), Some("😀"));
     }
 
     #[test]
-    fn reject_unmodeled_kitty_associated_text() {
-        assert_eq!(parse_terminal_key_sequence("\x1b[128512;1;128513u"), None);
-        assert_eq!(
-            parse_terminal_key_sequence("\x1b[128512;1;128512:65039u"),
-            None
-        );
+    fn parse_kitty_sequence_with_multicodepoint_ime_text() {
+        let key = parse_terminal_key_sequence("\x1b[32;;20320:22909u").unwrap();
+
+        assert_eq!(key.code, KeyCode::Char(' '));
+        assert_eq!(key.modifiers, KeyModifiers::empty());
+        assert_eq!(key.kind, crossterm::event::KeyEventKind::Press);
+        assert_eq!(key.generated_text.as_deref(), Some("你好"));
+    }
+
+    #[test]
+    fn parse_ctrl_chords_on_non_latin_layouts_as_their_base_layout_key() {
+        // Lab capture, kitty on a Russian layout: Ctrl+\u{441} is the C key.
+        for (sequence, code, modifiers) in [
+            (
+                "\x1b[1089::99;5u",
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            ),
+            // Ctrl+Shift keeps the layout character, as Ghostty sends it.
+            (
+                "\x1b[1089:1057:99;6u",
+                KeyCode::Char('\u{441}'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            // Shift implied only by the shifted alternate.
+            (
+                "\x1b[1089:1057:99;5u",
+                KeyCode::Char('\u{441}'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+            (
+                "\x1b[1089::99;5:3u",
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+            ),
+            // Without Ctrl it is text on that layout; without a base key
+            // nothing is known about the physical key.
+            (
+                "\x1b[1089::99u",
+                KeyCode::Char('\u{441}'),
+                KeyModifiers::empty(),
+            ),
+            (
+                "\x1b[1089;5u",
+                KeyCode::Char('\u{441}'),
+                KeyModifiers::CONTROL,
+            ),
+        ] {
+            let key = parse_terminal_key_sequence(sequence).expect(sequence);
+            assert_eq!((key.code, key.modifiers), (code, modifiers), "{sequence:?}");
+        }
+    }
+
+    #[test]
+    fn parse_ctrl_chords_on_every_non_latin_script_as_their_base_layout_key() {
+        // Greek, Cyrillic, Hebrew, Arabic, Thai, Georgian, Hangul, Cherokee
+        // (and its lowercase supplement), Canadian Syllabics, Mongolian.
+        for codepoint in [
+            945, 1092, 1513, 1588, 3615, 4304, 12609, 5024, 0xAB70, 5121, 6176,
+        ] {
+            for (event, kind) in [
+                ("", crossterm::event::KeyEventKind::Press),
+                (":2", crossterm::event::KeyEventKind::Repeat),
+                (":3", crossterm::event::KeyEventKind::Release),
+            ] {
+                let sequence = format!("\x1b[{codepoint}::97;5{event}u");
+                let key = parse_terminal_key_sequence(&sequence).unwrap();
+                assert_terminal_key_eq(key, KeyCode::Char('a'), KeyModifiers::CONTROL, kind, None);
+            }
+        }
+    }
+
+    /// Without a base-layout field nothing can be rewritten, so stripping it
+    /// gives the report as the layout key.
+    fn without_base_layout_field(sequence: &str) -> String {
+        let (key_part, rest) = sequence.split_once(';').unwrap_or((sequence, ""));
+        let mut fields = key_part.splitn(3, ':');
+        let codepoint = fields.next().unwrap_or_default();
+        let stripped = match fields.next() {
+            Some(shifted) if !shifted.is_empty() => format!("{codepoint}:{shifted}"),
+            _ => codepoint.to_string(),
+        };
+        if rest.is_empty() {
+            stripped
+        } else {
+            format!("{stripped};{rest}")
+        }
+    }
+
+    const LAYOUT_KEY_CHORDS: &[&str] = &[
+        // German \u{f6} on `;`, French \u{e9} on `2`, Turkish \u{131} on `i`,
+        // Nordic \u{e5} on `[`: Ctrl, Alt, Super, Ctrl+Shift, press and release.
+        "\x1b[246::59;5u",
+        "\x1b[246::59;5:3u",
+        "\x1b[246:214:59;6u",
+        "\x1b[233::50;5u",
+        "\x1b[233::50;3u",
+        "\x1b[305::105;5u",
+        "\x1b[305:73:105;6u",
+        "\x1b[229::91;5u",
+        "\x1b[229::91;9u",
+        "\x1b[229:197:91;6:3u",
+        // Textless AltGr (Ctrl+Alt), Latin and non-Latin.
+        "\x1b[281::101;7u",
+        "\x1b[281::101;7:3u",
+        "\x1b[1094::119;7u",
+        // Non-Latin chords other than Ctrl alone: plain, Shift, Ctrl+Shift,
+        // Alt, Super, Ctrl+Super. Ghostty sends the layout character for them.
+        "\x1b[1094::119;1u",
+        "\x1b[1094:1062:119;2u",
+        "\x1b[1093:1061:91;6u",
+        "\x1b[1094:1062:119;6:3u",
+        "\x1b[1094::119;3u",
+        "\x1b[1094::119;9u",
+        "\x1b[1094::119;13u",
+        // A chord that generated text is typing.
+        "\x1b[1094::119;5;1094u",
+        // Keys Ghostty sends no control byte for: Russian \u{448} on `i`,
+        // \u{44c} on `m`, \u{445} on `[`, \u{436} on `;`.
+        "\x1b[1096::105;5u",
+        "\x1b[1100::109;5u",
+        "\x1b[1093::91;5u",
+        "\x1b[1078::59;5u",
+        // macOS Option-generated characters reported with Alt.
+        "\x1b[248::111;3u",
+        "\x1b[8721::119;3u",
+        "\x1b[8721::119;3:3u",
+    ];
+
+    #[test]
+    fn parse_chords_other_than_non_latin_ctrl_keep_layout_key() {
+        for sequence in LAYOUT_KEY_CHORDS {
+            let stripped = without_base_layout_field(sequence);
+            assert_ne!(*sequence, stripped);
+            let key = parse_terminal_key_sequence(sequence).unwrap();
+            let layout_key = parse_terminal_key_sequence(&stripped).unwrap();
+            assert_eq!(key, layout_key, "{sequence:?}");
+            for pane_mode in [&b""[..], b"\x1b[>1u", b"\x1b[>5u", b"\x1b[>31u"] {
+                assert_eq!(
+                    crate::pane::test_encode_key_for_app(pane_mode, key.clone()),
+                    crate::pane::test_encode_key_for_app(pane_mode, layout_key.clone()),
+                    "{sequence:?} {pane_mode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parse_wezterm_control_associated_text_keeps_report_all_key_events() {
+        for (sequence, expected_code, expected_kind) in [
+            (
+                "\x1b[13;1;13u",
+                KeyCode::Enter,
+                crossterm::event::KeyEventKind::Press,
+            ),
+            (
+                "\x1b[13;1:3u",
+                KeyCode::Enter,
+                crossterm::event::KeyEventKind::Release,
+            ),
+            (
+                "\x1b[127::8;1;8u",
+                KeyCode::Backspace,
+                crossterm::event::KeyEventKind::Press,
+            ),
+            (
+                "\x1b[127::8;1:3u",
+                KeyCode::Backspace,
+                crossterm::event::KeyEventKind::Release,
+            ),
+            (
+                "\x1b[27;1;27u",
+                KeyCode::Esc,
+                crossterm::event::KeyEventKind::Press,
+            ),
+            (
+                "\x1b[9;1;9u",
+                KeyCode::Tab,
+                crossterm::event::KeyEventKind::Press,
+            ),
+        ] {
+            let key = parse_terminal_key_sequence(sequence).expect("captured key should parse");
+            assert_eq!(key.code, expected_code);
+            assert_eq!(key.modifiers, KeyModifiers::empty());
+            assert_eq!(key.kind, expected_kind);
+            assert_eq!(key.generated_text, None);
+        }
+    }
+
+    #[test]
+    fn reject_malformed_kitty_associated_text() {
+        assert_eq!(parse_terminal_key_sequence("\x1b[32;;1114112u"), None);
+        assert_eq!(parse_terminal_key_sequence("\x1b[32;;20320:bad:u"), None);
+        assert_eq!(parse_terminal_key_sequence("\x1b[32;;27u"), None);
+        assert_eq!(parse_terminal_key_sequence("\x1b[32;;133u"), None);
+        assert_eq!(parse_terminal_key_sequence("\x1b[13;1;8u"), None);
+        assert_eq!(parse_terminal_key_sequence("\x1b[127::8;1;13u"), None);
+        assert_eq!(parse_terminal_key_sequence("\x1b[13;1;13:10u"), None);
+        assert_eq!(parse_terminal_key_sequence("\x1b[9;1;27u"), None);
+        assert_eq!(parse_terminal_key_sequence("\x1b[27;1;9u"), None);
+        assert_eq!(parse_terminal_key_sequence("\x1b[9;1;9:97u"), None);
+        assert_eq!(parse_terminal_key_sequence("\x1b[27;1;27:27u"), None);
     }
 
     #[test]
@@ -737,6 +1125,22 @@ mod tests {
     }
 
     #[test]
+    fn parse_xterm_special_sequences_with_associated_text() {
+        for (sequence, expected_code) in [
+            ("\x1b[1;1;63233B", KeyCode::Down),
+            ("\x1b[5;1;63276~", KeyCode::PageUp),
+        ] {
+            let key = parse_terminal_key_sequence(sequence).unwrap();
+            assert_eq!(key.code, expected_code);
+            assert_eq!(key.modifiers, KeyModifiers::empty());
+            assert_eq!(key.kind, crossterm::event::KeyEventKind::Press);
+            assert_eq!(key.generated_text, None);
+        }
+
+        assert_eq!(parse_terminal_key_sequence("\x1b[1;1;63233;63234B"), None);
+    }
+
+    #[test]
     fn parse_kitty_functional_up_arrow_sequence() {
         let key = parse_terminal_key_sequence("\x1b[57419;1u").unwrap();
         assert_eq!(key.code, KeyCode::Up);
@@ -767,7 +1171,7 @@ mod tests {
     #[test]
     fn legacy_lf_roundtrips_as_lf() {
         let key = parse_terminal_key_sequence("\n").unwrap();
-        assert_eq!(encode_terminal_key(key, KeyboardProtocol::Legacy), b"\n");
+        assert_eq!(crate::pane::test_encode_key_for_app(b"", key), b"\n");
     }
 
     #[test]
@@ -851,8 +1255,27 @@ mod tests {
     }
 
     #[test]
-    fn unknown_kitty_functional_key_remains_unsupported() {
-        assert!(parse_terminal_key_sequence("\x1b[57364;1u").is_none());
+    fn kitty_f1_through_f12_codepoints_are_recognized() {
+        let cases = [
+            ("\x1b[57364;1u", KeyCode::F(1)),
+            ("\x1b[57365;1u", KeyCode::F(2)),
+            ("\x1b[57366;1u", KeyCode::F(3)),
+            ("\x1b[57367;1u", KeyCode::F(4)),
+            ("\x1b[57368;1u", KeyCode::F(5)),
+            ("\x1b[57375;1u", KeyCode::F(12)),
+            ("\x1b[57376;1u", KeyCode::F(13)),
+        ];
+
+        for (sequence, code) in cases {
+            let parsed = parse_terminal_key_sequence(sequence).unwrap();
+            assert_terminal_key_eq(
+                parsed,
+                code,
+                KeyModifiers::empty(),
+                crossterm::event::KeyEventKind::Press,
+                None,
+            );
+        }
     }
 
     fn assert_fixture_corpus_parses(corpus: &str) {

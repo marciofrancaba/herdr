@@ -16,17 +16,17 @@ impl App {
         pane: PluginManifestPane,
     ) -> String {
         let context = self.current_plugin_context("plugin-pane");
+        let cwd = self.plugin_pane_cwd(plugin, params.cwd);
         let extra_env =
-            match self.plugin_pane_launch_env(plugin, &pane.id, params.env.clone(), &context) {
+            match self.plugin_pane_launch_env(plugin, &pane.id, &cwd, params.env, &context) {
                 Ok(env) => env,
                 Err((code, message)) => return encode_error(id, &code, message),
             };
-        let cwd = Some(self.plugin_pane_cwd(plugin, params.cwd));
         let width = params.width.or(pane.width);
         let height = params.height.or(pane.height);
         if let Err(err) = self.spawn_popup_argv_command(
             &pane.command,
-            cwd,
+            Some(cwd),
             extra_env,
             crate::app::popup::PopupGeometry { width, height },
         ) {
@@ -49,17 +49,21 @@ impl App {
         pane: PluginManifestPane,
     ) -> String {
         let context = self.current_plugin_context("plugin-pane");
+        let cwd = self.plugin_pane_cwd(plugin, params.cwd);
         let extra_env =
-            match self.plugin_pane_launch_env(plugin, &pane.id, params.env.clone(), &context) {
+            match self.plugin_pane_launch_env(plugin, &pane.id, &cwd, params.env, &context) {
                 Ok(env) => env,
                 Err((code, message)) => return encode_error(id, &code, message),
             };
-        let cwd = Some(self.plugin_pane_cwd(plugin, params.cwd));
-        let (ws_idx, new_pane) =
-            match self.spawn_overlay_argv_command(&pane.command, cwd, extra_env, Vec::new()) {
-                Ok(result) => result,
-                Err(err) => return encode_error(id, "plugin_pane_open_failed", err.to_string()),
-            };
+        let (ws_idx, new_pane) = match self.spawn_overlay_argv_command(
+            &pane.command,
+            Some(cwd),
+            extra_env,
+            Vec::new(),
+        ) {
+            Ok(result) => result,
+            Err(err) => return encode_error(id, "plugin_pane_open_failed", err.to_string()),
+        };
         let layout_tab_idx = self
             .overlay_panes
             .get(&new_pane.pane_id)
@@ -98,8 +102,9 @@ impl App {
             );
         };
         let context = self.plugin_context_for_pane(ws_idx, target_pane, "plugin-pane");
+        let cwd = self.plugin_pane_cwd(plugin, params.cwd);
         let extra_env =
-            match self.plugin_pane_launch_env(plugin, &pane.id, params.env.clone(), &context) {
+            match self.plugin_pane_launch_env(plugin, &pane.id, &cwd, params.env, &context) {
                 Ok(env) => env,
                 Err((code, message)) => return encode_error(id, &code, message),
             };
@@ -110,8 +115,17 @@ impl App {
             crate::api::schema::SplitDirection::Right => Direction::Horizontal,
             crate::api::schema::SplitDirection::Down => Direction::Vertical,
         };
-        let cwd = Some(self.plugin_pane_cwd(plugin, params.cwd));
-        let (rows, cols) = self.state.estimate_pane_size();
+        let new_pane_placement = if placement == PluginPanePlacement::Zoomed {
+            crate::ui::NewPanePlacement::ZoomedOverlay
+        } else {
+            crate::ui::NewPanePlacement::Split {
+                ws_idx,
+                target: target_pane,
+                direction,
+                ratio: 0.5,
+            }
+        };
+        let (rows, cols) = self.state.new_pane_size(new_pane_placement);
         let previous_focus = self.state.current_pane_focus_target();
         let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
             return encode_error(id, "workspace_not_found", "workspace not found");
@@ -119,13 +133,14 @@ impl App {
         let result = ws.split_pane_argv_command(
             target_pane,
             direction,
-            rows.max(4),
-            cols.max(10),
-            cwd,
+            rows,
+            cols,
+            Some(cwd),
             &pane.command,
             extra_env,
             self.state.pane_scrollback_limit_bytes,
             self.state.host_terminal_theme,
+            self.state.host_terminal_appearance,
             params.focus || placement == PluginPanePlacement::Zoomed,
         );
         let (tab_idx, new_pane) = match result {
@@ -186,22 +201,23 @@ impl App {
         let cwd = self.plugin_pane_cwd(plugin, params.cwd);
         let context = self.plugin_context_for_workspace(ws_idx, "plugin-pane");
         let extra_env =
-            match self.plugin_pane_launch_env(plugin, &pane.id, params.env.clone(), &context) {
+            match self.plugin_pane_launch_env(plugin, &pane.id, &cwd, params.env, &context) {
                 Ok(env) => env,
                 Err((code, message)) => return encode_error(id, &code, message),
             };
-        let (rows, cols) = self.state.estimate_pane_size();
+        let (rows, cols) = self.state.new_pane_size(crate::ui::NewPanePlacement::Alone);
         let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
             return encode_error(id, "workspace_not_found", "workspace not found");
         };
         let (tab_idx, terminal, runtime) = match ws.create_tab_argv_command(
-            rows.max(4),
-            cols.max(10),
+            rows,
+            cols,
             cwd,
             &pane.command,
             extra_env,
             self.state.pane_scrollback_limit_bytes,
             self.state.host_terminal_theme,
+            self.state.host_terminal_appearance,
         ) {
             Ok(result) => result,
             Err(err) => return encode_error(id, "plugin_pane_open_failed", err.to_string()),
@@ -231,10 +247,12 @@ impl App {
         &self,
         plugin: &InstalledPluginInfo,
         entrypoint: &str,
+        cwd: &std::path::Path,
         env: std::collections::HashMap<String, String>,
         context: &PluginInvocationContext,
     ) -> Result<Vec<(String, String)>, (String, String)> {
         let mut env = super::super::env::normalize_launch_env(env)?;
+        crate::platform::set_default_plugin_pane_pwd(&mut env, cwd);
         let context_json = serde_json::to_string(&context)
             .map_err(|err| ("invalid_plugin_context".to_string(), err.to_string()))?;
         super::env::ensure_plugin_user_dirs(plugin)
@@ -252,7 +270,7 @@ impl App {
             entrypoint.to_string(),
         ));
         env.push(("HERDR_PLUGIN_CONTEXT_JSON".to_string(), context_json));
-        if let Ok(current_exe) = std::env::current_exe() {
+        if let Ok(current_exe) = crate::platform::launch_executable() {
             env.push((
                 "HERDR_BIN_PATH".to_string(),
                 current_exe.display().to_string(),

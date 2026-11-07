@@ -1,7 +1,11 @@
 #[cfg(windows)]
+use std::collections::VecDeque;
+#[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(windows)]
 use std::sync::Arc;
+#[cfg(windows)]
+use std::{fs::OpenOptions, io::Write as _};
 
 #[cfg(windows)]
 use tokio::sync::mpsc;
@@ -16,65 +20,134 @@ pub(super) fn raw_console_reader_loop(
     handle: windows_sys::Win32::Foundation::HANDLE,
     event_tx: mpsc::Sender<ClientLoopEvent>,
     should_quit: &Arc<AtomicBool>,
+    host_color_query_sent: bool,
 ) {
     let mut mapper = WindowsInputMapper::default();
     let mut pump = WindowsInputPump::default();
+    if host_color_query_sent {
+        // Native records distinguish physical Escape from scan-code-zero host replies.
+        pump.framer
+            .host_default_color_query_sent(std::time::Duration::from_secs(1));
+        super::super::query_host_terminal_theme();
+    }
+    let mut handoff = WindowsInputHandoff::default();
 
     while !should_quit.load(Ordering::Acquire) {
-        match windows_console_input_items(handle, &mut mapper) {
+        let mut trace = windows_input_trace_enabled().then(WindowsInputTraceBatch::default);
+        match windows_console_input_items(handle, &mut mapper, trace.as_mut()) {
             WindowsInputItems::Items(items) => {
-                if !process_platform_input_items(items, &mut pump, &event_tx) {
-                    return;
-                }
+                process_platform_input_items(items, &mut pump, &mut handoff, trace.as_mut());
             }
             WindowsInputItems::Idle => {
-                if !process_platform_input_items(mapper.idle(), &mut pump, &event_tx) {
-                    return;
-                }
-                if !send_windows_client_input_events(pump.idle(), &event_tx) {
-                    return;
-                }
+                process_platform_input_items(
+                    mapper.idle(),
+                    &mut pump,
+                    &mut handoff,
+                    trace.as_mut(),
+                );
+                push_platform_input_events(pump.idle(), &mut handoff, trace.as_mut());
             }
             WindowsInputItems::Closed => return,
         }
+        let handoff_open = handoff.try_flush(&event_tx);
+        if let Some(trace) = trace
+            .filter(|trace| !trace.raw_keys.is_empty() || !trace.mapped_event_groups.is_empty())
+        {
+            tracing::info!(
+                raw_keys = ?trace.raw_keys,
+                mapped_event_groups = ?trace.mapped_event_groups,
+                "windows input trace: input batch"
+            );
+        }
+        if !handoff_open {
+            return;
+        }
     }
 }
+
+#[cfg(windows)]
+pub(super) fn trace_input_transport(value: &str) {
+    let Some(path) = std::env::var_os("HERDR_WINDOWS_INPUT_TRACE_FILE") else {
+        return;
+    };
+    if let Ok(mut output) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(output, "{value}");
+    }
+}
+
+#[cfg(not(windows))]
+fn trace_input_transport(_value: &str) {}
 
 #[cfg(windows)]
 fn process_platform_input_items(
     items: Vec<PlatformInputItem>,
     pump: &mut WindowsInputPump,
-    event_tx: &mpsc::Sender<ClientLoopEvent>,
-) -> bool {
+    handoff: &mut WindowsInputHandoff,
+    mut trace: Option<&mut WindowsInputTraceBatch>,
+) {
     for item in items {
-        if !send_windows_client_input_events(pump.process(item), event_tx) {
-            return false;
-        }
+        push_platform_input_events(pump.process(item), handoff, trace.as_deref_mut());
     }
-    true
 }
 
 #[cfg(windows)]
+fn push_platform_input_events(
+    events: Vec<crate::protocol::ClientInputEvent>,
+    handoff: &mut WindowsInputHandoff,
+    trace: Option<&mut WindowsInputTraceBatch>,
+) {
+    if events.is_empty() {
+        return;
+    }
+    if let Some(trace) = trace {
+        trace.mapped_event_groups.push(events.clone());
+    }
+    handoff.push(events);
+}
+
+#[cfg(windows)]
+/// The console input buffer: standard input when it is the console, otherwise
+/// the attached console's `CONIN$` (stdin redirected, e.g. mintty).
 pub(super) fn console_input_handle() -> std::io::Result<windows_sys::Win32::Foundation::HANDLE> {
-    use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
+    use windows_sys::Win32::Foundation::{
+        GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    use windows_sys::Win32::System::Console::{GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE};
 
-    let handle: HANDLE = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
-    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(handle)
+    let is_console = |handle: HANDLE| {
+        let mut mode = 0;
+        !handle.is_null()
+            && handle != INVALID_HANDLE_VALUE
+            && unsafe { GetConsoleMode(handle, &mut mode) } != 0
+    };
+
+    // SAFETY: querying the process standard input handle has no preconditions.
+    let stdin: HANDLE = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if is_console(stdin) {
+        return Ok(stdin);
     }
-}
-
-#[cfg(windows)]
-pub(super) fn virtual_terminal_input_enabled(
-    handle: windows_sys::Win32::Foundation::HANDLE,
-) -> bool {
-    use windows_sys::Win32::System::Console::{GetConsoleMode, ENABLE_VIRTUAL_TERMINAL_INPUT};
-
-    let mut mode = 0;
-    (unsafe { GetConsoleMode(handle, &mut mode) } != 0) && mode & ENABLE_VIRTUAL_TERMINAL_INPUT != 0
+    let name: Vec<u16> = "CONIN$".encode_utf16().chain(Some(0)).collect();
+    // SAFETY: `name` is NUL-terminated and outlives the call; the handle is owned
+    // by the reader for the rest of the process.
+    let conin = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            0,
+            std::ptr::null_mut(),
+        )
+    };
+    if is_console(conin) {
+        Ok(conin)
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 #[cfg(windows)]
@@ -85,9 +158,114 @@ enum WindowsInputItems {
 }
 
 #[cfg(windows)]
+#[derive(Default)]
+struct WindowsInputTraceBatch {
+    raw_keys: Vec<WindowsKeyRecord>,
+    mapped_event_groups: Vec<Vec<crate::protocol::ClientInputEvent>>,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct WindowsInputHandoff {
+    pending: VecDeque<Vec<crate::protocol::ClientInputEvent>>,
+    backpressured: bool,
+}
+
+#[cfg(windows)]
+impl WindowsInputHandoff {
+    fn push(&mut self, events: Vec<crate::protocol::ClientInputEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        if self.backpressured {
+            self.push_backpressured(events);
+        } else {
+            self.pending.push_back(events);
+        }
+    }
+
+    fn try_flush(&mut self, event_tx: &mpsc::Sender<ClientLoopEvent>) -> bool {
+        // Keep draining the console while the client loop is busy. Blocking here
+        // lets the OpenSSH/ConPTY input path lose pieces of raw VT reports.
+        loop {
+            if self.pending.is_empty() {
+                self.backpressured = false;
+                return true;
+            }
+            match event_tx.try_reserve() {
+                Ok(permit) => {
+                    let Some(events) = self.pending.pop_front() else {
+                        continue;
+                    };
+                    permit.send(ClientLoopEvent::StdinEvents(events));
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    if !self.backpressured {
+                        self.backpressured = true;
+                        let pending = std::mem::take(&mut self.pending);
+                        for events in pending {
+                            self.push_backpressured(events);
+                        }
+                    }
+                    return true;
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => return false,
+            }
+        }
+    }
+
+    fn push_backpressured(&mut self, events: Vec<crate::protocol::ClientInputEvent>) {
+        if let Some(previous) = self.pending.back_mut() {
+            if let ([previous_event], [next_event]) = (previous.as_slice(), events.as_slice()) {
+                if windows_mouse_motion_can_replace(previous_event, next_event) {
+                    *previous = events;
+                    return;
+                }
+            }
+        }
+        self.pending.push_back(events);
+    }
+}
+
+#[cfg(windows)]
+fn windows_mouse_motion_can_replace(
+    previous: &crate::protocol::ClientInputEvent,
+    next: &crate::protocol::ClientInputEvent,
+) -> bool {
+    use crate::protocol::{ClientInputEvent, ClientMouseKind};
+
+    let (
+        ClientInputEvent::Mouse {
+            kind: previous_kind,
+            modifiers: previous_modifiers,
+            ..
+        },
+        ClientInputEvent::Mouse {
+            kind: next_kind,
+            modifiers: next_modifiers,
+            ..
+        },
+    ) = (previous, next)
+    else {
+        return false;
+    };
+    if previous_modifiers != next_modifiers {
+        return false;
+    }
+    matches!(
+        (previous_kind, next_kind),
+        (ClientMouseKind::Moved, ClientMouseKind::Moved)
+    ) || matches!(
+        (previous_kind, next_kind),
+        (ClientMouseKind::Drag(previous), ClientMouseKind::Drag(next)) if previous == next
+    )
+}
+
+#[cfg(windows)]
 fn windows_console_input_items(
     handle: windows_sys::Win32::Foundation::HANDLE,
     mapper: &mut WindowsInputMapper,
+    mut trace: Option<&mut WindowsInputTraceBatch>,
 ) -> WindowsInputItems {
     const WAIT_OBJECT_0: u32 = 0;
     const WAIT_TIMEOUT: u32 = 258;
@@ -115,6 +293,9 @@ fn windows_console_input_items(
     let mut items = Vec::new();
     for record in records.iter().take(read as usize) {
         if let Some(record) = windows_console_input_record_from_os(*record) {
+            if let (Some(trace), WindowsInputRecord::Key(key)) = (trace.as_deref_mut(), record) {
+                trace.raw_keys.push(key);
+            }
             items.extend(mapper.translate(record));
         }
     }
@@ -180,18 +361,34 @@ struct WindowsInputMapper {
     pending_paste_high_surrogate: Option<u16>,
     mouse_buttons: WindowsMouseButtons,
     win32_input: WindowsWin32InputModeFramer,
+    pending_escape_origin: Option<EscapeOrigin>,
 }
 
 struct WindowsInputPump {
     framer: crate::raw_input::RawInputFramer,
+    pending_escape_origin: Option<EscapeOrigin>,
     paste_from_win32_key_records: bool,
+    pending_physical_escape: Option<(crate::protocol::ClientInputEvent, bool)>,
+    default_mouse_candidate: DefaultMouseCandidate,
+    consumed_default_mouse_keys: Vec<WindowsKeyRecord>,
+}
+
+#[derive(Default)]
+struct DefaultMouseCandidate {
+    active: bool,
+    events: Vec<crate::protocol::ClientInputEvent>,
+    unreleased_keys: Vec<WindowsKeyRecord>,
 }
 
 impl Default for WindowsInputPump {
     fn default() -> Self {
         Self {
             framer: crate::raw_input::RawInputFramer::for_host_input(),
+            pending_escape_origin: None,
             paste_from_win32_key_records: false,
+            pending_physical_escape: None,
+            default_mouse_candidate: DefaultMouseCandidate::default(),
+            consumed_default_mouse_keys: Vec::new(),
         }
     }
 }
@@ -199,17 +396,26 @@ impl Default for WindowsInputPump {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum PlatformInputItem {
     Bytes(Vec<u8>),
+    Escape(EscapeOrigin),
     Semantic(crate::protocol::ClientInputEvent),
     PasteAwareBytes {
         paste_bytes: Vec<u8>,
         raw_bytes: Vec<u8>,
         win32_paste_bytes: Vec<u8>,
+        nested_record: WindowsKeyRecord,
     },
     PasteAwareKey {
         bytes: Vec<u8>,
         win32_paste_bytes: Vec<u8>,
         events: Vec<crate::protocol::ClientInputEvent>,
+        nested_record: Option<WindowsKeyRecord>,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EscapeOrigin {
+    HostReply,
+    Keyboard,
 }
 
 #[derive(Default)]
@@ -226,14 +432,63 @@ enum WindowsWin32InputModeItem {
 }
 
 impl WindowsInputPump {
+    fn flush_before_semantic(&mut self) -> Vec<crate::raw_input::RawInputEvent> {
+        // A scan-code-zero reply prefix can outlive an unrelated keyboard record.
+        if self.pending_escape_origin == Some(EscapeOrigin::HostReply)
+            && self.framer.holds_host_default_color_escape()
+        {
+            return Vec::new();
+        }
+        self.pending_escape_origin = None;
+        self.framer.flush_interrupted()
+    }
+
     fn process(&mut self, item: PlatformInputItem) -> Vec<crate::protocol::ClientInputEvent> {
-        match item {
+        let mut events = Vec::new();
+        if let Some((escape, open_bracket)) = self.pending_physical_escape.take() {
+            let raw_bytes = item.raw_bytes();
+            let continues_sgr = if open_bracket {
+                raw_bytes.is_some_and(|bytes| bytes.starts_with(b"<"))
+            } else {
+                raw_bytes.is_some_and(|bytes| bytes.starts_with(b"[<"))
+            };
+            if continues_sgr {
+                let prefix: &[u8] = if open_bracket { b"\x1b[" } else { b"\x1b" };
+                let raw_events = self.framer.push(prefix);
+                events.extend(self.process_raw_events(raw_events));
+            } else if !open_bracket && raw_bytes == Some(b"[") {
+                self.pending_physical_escape = Some((escape, true));
+                return events;
+            } else {
+                events.push(escape);
+                if open_bracket {
+                    let raw_events = self.framer.push(b"[");
+                    events.extend(self.process_raw_events(raw_events));
+                }
+            }
+        }
+        if let Some(escape) = item.physical_escape_press() {
+            if !self.framer.has_pending_bracketed_paste() {
+                let raw_events = self.flush_before_semantic();
+                events.extend(self.process_raw_events(raw_events));
+                self.pending_physical_escape = Some((escape, false));
+                return events;
+            }
+        }
+
+        let mut next = match item {
             PlatformInputItem::Bytes(bytes) => {
+                self.pending_escape_origin = None;
                 let raw_events = self.framer.push(&bytes);
                 self.process_raw_events(raw_events)
             }
+            PlatformInputItem::Escape(origin) => {
+                self.pending_escape_origin = Some(origin);
+                let raw_events = self.framer.push(b"\x1b");
+                self.process_raw_events(raw_events)
+            }
             PlatformInputItem::Semantic(event) => {
-                let raw_events = self.framer.flush_timeout();
+                let raw_events = self.flush_before_semantic();
                 let mut events = self.process_raw_events(raw_events);
                 events.push(event);
                 events
@@ -242,29 +497,47 @@ impl WindowsInputPump {
                 paste_bytes,
                 raw_bytes,
                 win32_paste_bytes,
+                nested_record,
             } => {
-                let pending_paste = self.framer.has_pending_bracketed_paste();
-                let decode_win32_record = self.paste_from_win32_key_records || !pending_paste;
-                let raw_events = if decode_win32_record {
-                    if pending_paste {
-                        self.framer.push(&win32_paste_bytes)
-                    } else {
-                        self.framer.push(&raw_bytes)
-                    }
+                if self.consume_default_mouse_key_event(nested_record) {
+                    Vec::new()
                 } else {
-                    self.framer.push(&paste_bytes)
-                };
-                if decode_win32_record && self.framer.has_pending_bracketed_paste() {
-                    self.paste_from_win32_key_records = true;
+                    let pending_paste = self.framer.has_pending_bracketed_paste();
+                    if !pending_paste && self.framer.has_pending_default_mouse_sequence() {
+                        self.stage_default_mouse_record(nested_record, &raw_bytes);
+                    }
+                    let decode_win32_record = self.paste_from_win32_key_records || !pending_paste;
+                    self.pending_escape_origin = if decode_win32_record && !pending_paste {
+                        WindowsInputMapper::raw_escape_origin(nested_record)
+                    } else {
+                        None
+                    };
+                    let raw_events = if decode_win32_record {
+                        if pending_paste {
+                            self.framer.push(&win32_paste_bytes)
+                        } else {
+                            self.framer.push(&raw_bytes)
+                        }
+                    } else {
+                        self.framer.push(&paste_bytes)
+                    };
+                    if decode_win32_record && self.framer.has_pending_bracketed_paste() {
+                        self.paste_from_win32_key_records = true;
+                    }
+                    self.process_raw_events(raw_events)
                 }
-                self.process_raw_events(raw_events)
             }
             PlatformInputItem::PasteAwareKey {
                 bytes,
                 win32_paste_bytes,
                 events,
+                nested_record,
             } => {
-                if self.framer.has_pending_bracketed_paste() {
+                let suppress_consumed_key = nested_record
+                    .is_some_and(|record| self.consume_default_mouse_key_event(record));
+                if suppress_consumed_key {
+                    Vec::new()
+                } else if self.framer.has_pending_bracketed_paste() {
                     let bytes = if self.paste_from_win32_key_records {
                         &win32_paste_bytes
                     } else {
@@ -272,32 +545,119 @@ impl WindowsInputPump {
                     };
                     let raw_events = self.framer.push(bytes);
                     self.process_raw_events(raw_events)
+                } else if let Some(record) =
+                    nested_record.filter(|_| self.framer.has_pending_default_mouse_sequence())
+                {
+                    self.stage_default_mouse_key(record, &win32_paste_bytes, events);
+                    let raw_events = self.framer.push(&win32_paste_bytes);
+                    self.process_raw_events(raw_events)
                 } else {
-                    let raw_events = self.framer.flush_timeout();
+                    let raw_events = if events.is_empty() {
+                        self.framer.flush_timeout()
+                    } else {
+                        self.flush_before_semantic()
+                    };
                     let mut output = self.process_raw_events(raw_events);
                     output.extend(events);
                     output
                 }
             }
-        }
+        };
+        events.append(&mut next);
+        events
     }
 
     fn idle(&mut self) -> Vec<crate::protocol::ClientInputEvent> {
-        let raw_events = self.framer.flush_timeout();
-        self.process_raw_events(raw_events)
+        let mut events = Vec::new();
+        if let Some((escape, open_bracket)) = self.pending_physical_escape.take() {
+            events.push(escape);
+            if open_bracket {
+                let raw_events = self.framer.push(b"[");
+                events.extend(self.process_raw_events(raw_events));
+            }
+        }
+        let raw_events = if self.pending_escape_origin == Some(EscapeOrigin::Keyboard) {
+            self.pending_escape_origin = None;
+            self.framer.flush_keyboard_escape()
+        } else {
+            self.framer.flush_timeout()
+        };
+        events.extend(self.process_raw_events(raw_events));
+        events
     }
 
     fn process_raw_events(
         &mut self,
-        events: Vec<crate::raw_input::RawInputEvent>,
+        mut events: Vec<crate::raw_input::RawInputEvent>,
     ) -> Vec<crate::protocol::ClientInputEvent> {
-        if events
-            .iter()
-            .any(|event| matches!(event, crate::raw_input::RawInputEvent::Paste(_)))
-        {
-            self.paste_from_win32_key_records = false;
+        for event in &mut events {
+            if let crate::raw_input::RawInputEvent::Paste(text) = event {
+                let decoded = if self.paste_from_win32_key_records {
+                    None
+                } else {
+                    decode_win32_paste_payload(text)
+                };
+                if let Some(decoded) = decoded {
+                    *text = decoded;
+                } else {
+                    decode_windows_terminal_paste_enters(text);
+                }
+                self.paste_from_win32_key_records = false;
+            }
         }
-        Self::raw_events_to_client_events(events)
+
+        let accepted_default_mouse = self.default_mouse_candidate.active
+            && events
+                .iter()
+                .any(|event| matches!(event, crate::raw_input::RawInputEvent::Mouse(_)));
+        let mut output = Self::raw_events_to_client_events(events);
+        if self.default_mouse_candidate.active && !self.framer.has_pending_default_mouse_sequence()
+        {
+            self.default_mouse_candidate.active = false;
+            if accepted_default_mouse {
+                self.default_mouse_candidate.events.clear();
+                self.consumed_default_mouse_keys
+                    .append(&mut self.default_mouse_candidate.unreleased_keys);
+            } else {
+                let mut staged = std::mem::take(&mut self.default_mouse_candidate.events);
+                self.default_mouse_candidate.unreleased_keys.clear();
+                staged.append(&mut output);
+                output = staged;
+            }
+        }
+        output
+    }
+
+    fn stage_default_mouse_key(
+        &mut self,
+        record: WindowsKeyRecord,
+        raw_bytes: &[u8],
+        events: Vec<crate::protocol::ClientInputEvent>,
+    ) {
+        self.default_mouse_candidate.events.extend(events);
+        self.stage_default_mouse_record(record, raw_bytes);
+    }
+
+    fn stage_default_mouse_record(&mut self, record: WindowsKeyRecord, raw_bytes: &[u8]) {
+        self.default_mouse_candidate.active = true;
+        if record.key_down
+            && !raw_bytes.is_empty()
+            && (record.virtual_key_code != 0 || record.virtual_scan_code != 0)
+        {
+            if matching_key_index(&self.default_mouse_candidate.unreleased_keys, record).is_none() {
+                self.default_mouse_candidate.unreleased_keys.push(record);
+            }
+        } else if !record.key_down {
+            remove_matching_key(&mut self.default_mouse_candidate.unreleased_keys, record);
+        }
+    }
+
+    fn consume_default_mouse_key_event(&mut self, record: WindowsKeyRecord) -> bool {
+        let Some(index) = matching_key_index(&self.consumed_default_mouse_keys, record) else {
+            return false;
+        };
+        self.consumed_default_mouse_keys.remove(index);
+        !record.key_down
     }
 
     fn raw_events_to_client_events(
@@ -310,11 +670,152 @@ impl WindowsInputPump {
     }
 }
 
+fn matching_key_index(keys: &[WindowsKeyRecord], record: WindowsKeyRecord) -> Option<usize> {
+    keys.iter().position(|candidate| {
+        candidate.virtual_key_code == record.virtual_key_code
+            && candidate.virtual_scan_code == record.virtual_scan_code
+    })
+}
+
+fn remove_matching_key(keys: &mut Vec<WindowsKeyRecord>, record: WindowsKeyRecord) -> bool {
+    let Some(index) = matching_key_index(keys, record) else {
+        return false;
+    };
+    keys.remove(index);
+    true
+}
+
+impl PlatformInputItem {
+    fn raw_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Self::Escape(_) => Some(b"\x1b"),
+            Self::Bytes(bytes)
+            | Self::PasteAwareBytes {
+                raw_bytes: bytes, ..
+            } => Some(bytes),
+            Self::Semantic(_) | Self::PasteAwareKey { .. } => None,
+        }
+    }
+
+    fn physical_escape_press(&self) -> Option<crate::protocol::ClientInputEvent> {
+        let event = match self {
+            Self::Semantic(event) => event,
+            Self::PasteAwareKey { events, .. } if events.len() == 1 => &events[0],
+            _ => return None,
+        };
+        matches!(
+            event,
+            crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Esc,
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Press,
+                repeat_count: 1,
+                source: crate::protocol::ClientKeySource::WindowsConsole { record },
+                ..
+            } if record.virtual_scan_code != 0
+        )
+        .then(|| event.clone())
+    }
+}
+
+/// WezTerm can put serialized key records inside raw bracketed-paste markers.
+/// Only recognize a complete payload of matching text press/release pairs and
+/// modifier-only reports. Mixed, incomplete, or unsupported payloads stay opaque.
+fn decode_win32_paste_payload(text: &str) -> Option<String> {
+    let mut reports = text.split_inclusive('_');
+    let mut units = Vec::new();
+    while let Some(report) = reports.next() {
+        let pressed = parse_win32_paste_record(report)?;
+        if WindowsInputMapper::key_record_is_modifier_only(pressed) {
+            continue;
+        }
+        if !pressed.key_down || pressed.unicode == 0 {
+            return None;
+        }
+        let released = parse_win32_paste_record(reports.next()?)?;
+        if released
+            != (WindowsKeyRecord {
+                key_down: false,
+                ..pressed
+            })
+        {
+            return None;
+        }
+        units.push(pressed.unicode);
+    }
+    if units.is_empty() {
+        return None;
+    }
+    // Decode locally so invalid or incomplete surrogates cannot leak into the
+    // next paste, and reject rather than partially replacing malformed text.
+    String::from_utf16(&units).ok()
+}
+
+fn parse_win32_paste_record(report: &str) -> Option<WindowsKeyRecord> {
+    let body = report.strip_prefix("\x1b[")?.strip_suffix('_')?;
+    if !body
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || byte == b';')
+        || !matches!(body.split(';').nth(3), Some("0" | "1"))
+    {
+        return None;
+    }
+    let record = parse_win32_input_mode_key_record(body)?;
+    // This compatibility exception covers the captured one-unit records, not
+    // repeated key streams that could expand a small paste into large output.
+    (record.repeat_count == 1).then_some(record)
+}
+
+fn decode_windows_terminal_paste_enters(text: &mut String) {
+    const ENTER_REPORT_PAIR: &str = "\x1b[13;28;13;1;0;1_\x1b[13;28;13;0;0;1_";
+
+    // Windows Terminal can encode pasted newlines as an adjacent unmodified
+    // Enter press/release pair. Keep every other report-shaped payload opaque.
+    if text.contains(ENTER_REPORT_PAIR) {
+        *text = text.replace(ENTER_REPORT_PAIR, "\r");
+    }
+}
+
 #[cfg(test)]
 #[derive(Default)]
 struct WindowsInputTranslator {
     mapper: WindowsInputMapper,
     pump: WindowsInputPump,
+}
+
+/// Test handle that feeds native key records through the real Windows input
+/// translation (mapper + pump), for cross-module conformance tests.
+#[cfg(all(test, windows))]
+#[derive(Default)]
+pub(crate) struct TestWindowsInput(WindowsInputTranslator);
+
+#[cfg(all(test, windows))]
+impl TestWindowsInput {
+    pub(crate) fn key_in_layout(
+        &mut self,
+        record: crate::input::WindowsKeyRecord,
+        layout: windows_sys::Win32::UI::Input::KeyboardAndMouse::HKL,
+    ) -> Vec<crate::protocol::ClientInputEvent> {
+        let oem_char = (is_oem_virtual_key(record.virtual_key_code) && record.unicode == 0)
+            .then(|| {
+                crate::platform::resolve_base_printable_key_in_layout(
+                    record.virtual_key_code,
+                    record.virtual_scan_code,
+                    layout,
+                )
+            })
+            .flatten();
+        self.0
+            .mapper
+            .translate_key_with_oem_char(record, oem_char)
+            .into_iter()
+            .flat_map(|item| self.0.pump.process(item))
+            .collect()
+    }
+
+    pub(crate) fn idle(&mut self) -> Vec<crate::protocol::ClientInputEvent> {
+        self.0.idle()
+    }
 }
 
 #[cfg(test)]
@@ -349,8 +850,16 @@ impl WindowsInputMapper {
         self.win32_input
             .flush_timeout()
             .into_iter()
-            .map(PlatformInputItem::Bytes)
+            .map(|bytes| self.raw_byte_item(bytes))
             .collect()
+    }
+
+    fn raw_byte_item(&mut self, bytes: Vec<u8>) -> PlatformInputItem {
+        let origin = self.pending_escape_origin.take();
+        match origin {
+            Some(origin) if bytes.as_slice() == b"\x1b" => PlatformInputItem::Escape(origin),
+            _ => PlatformInputItem::Bytes(bytes),
+        }
     }
 
     fn translate(&mut self, record: WindowsInputRecord) -> Vec<PlatformInputItem> {
@@ -375,23 +884,22 @@ impl WindowsInputMapper {
     }
 
     fn translate_key(&mut self, key: WindowsKeyRecord) -> Vec<PlatformInputItem> {
-        if windows_input_trace_enabled() {
-            tracing::info!(
-                key_down = key.key_down,
-                repeat_count = key.repeat_count,
-                virtual_key_code = key.virtual_key_code,
-                virtual_scan_code = key.virtual_scan_code,
-                unicode = key.unicode,
-                control_key_state = key.control_key_state,
-                "windows input trace: console key record"
-            );
-        }
+        self.translate_key_with_oem_char(key, resolve_ctrl_oem_char(key))
+    }
 
+    fn translate_key_with_oem_char(
+        &mut self,
+        key: WindowsKeyRecord,
+        oem_char: Option<char>,
+    ) -> Vec<PlatformInputItem> {
         if !self.key_record_can_emit_event(key) {
             return Vec::new();
         }
 
-        if self.key_record_is_raw_escape(key) {
+        if let Some(origin) = Self::raw_escape_origin(key) {
+            if self.win32_input.buffer.is_empty() {
+                self.pending_escape_origin = Some(origin);
+            }
             return self.translate_win32_input_mode_bytes(&[0x1b]);
         }
 
@@ -407,6 +915,7 @@ impl WindowsInputMapper {
                         win32_paste_bytes: bytes.clone(),
                         bytes,
                         events: vec![event],
+                        nested_record: None,
                     });
                 } else if let Some(bytes) = self.synthetic_utf16_unit_to_bytes(key.unicode) {
                     items.extend(self.translate_win32_input_mode_bytes(&bytes));
@@ -419,12 +928,13 @@ impl WindowsInputMapper {
             };
         }
 
-        let events = self.translate_semantic_key_events(key);
+        let events = self.translate_semantic_key_events(key, oem_char);
         let items = if let Some(bytes) = self.paste_payload_bytes_for_key(key) {
             vec![PlatformInputItem::PasteAwareKey {
                 win32_paste_bytes: bytes.clone(),
                 bytes,
                 events,
+                nested_record: None,
             }]
         } else {
             events
@@ -435,13 +945,13 @@ impl WindowsInputMapper {
         self.with_pending_win32_flush(items)
     }
 
-    fn key_record_is_raw_escape(&self, key: WindowsKeyRecord) -> bool {
+    fn raw_escape_origin(key: WindowsKeyRecord) -> Option<EscapeOrigin> {
         let modifiers = windows_key_modifiers(key.control_key_state);
         if !key.key_down
             || key.repeat_count.max(1) != 1
             || modifiers.contains(crossterm::event::KeyModifiers::ALT)
         {
-            return false;
+            return None;
         }
 
         // Physical Escape carries a scan code. Scan-code-zero Escape can
@@ -453,17 +963,23 @@ impl WindowsInputMapper {
             && key.unicode == 0x1b
             && modifiers == crossterm::event::KeyModifiers::CONTROL;
 
-        bare_escape || ctrl_bracket
+        if bare_escape && key.virtual_scan_code == 0 {
+            Some(EscapeOrigin::HostReply)
+        } else if bare_escape || ctrl_bracket {
+            Some(EscapeOrigin::Keyboard)
+        } else {
+            None
+        }
     }
 
     fn translate_win32_input_mode_bytes(&mut self, bytes: &[u8]) -> Vec<PlatformInputItem> {
         let mut items = Vec::new();
         for item in self.win32_input.push(bytes) {
             match item {
-                WindowsWin32InputModeItem::Bytes(bytes) => {
-                    items.push(PlatformInputItem::Bytes(bytes))
-                }
+                WindowsWin32InputModeItem::Bytes(bytes) => items.push(self.raw_byte_item(bytes)),
                 WindowsWin32InputModeItem::Key { bytes, record } => {
+                    self.pending_escape_origin = None;
+                    trace_input_transport("transport=win32-serialized");
                     let win32_paste_bytes =
                         self.paste_payload_bytes_for_key(record).unwrap_or_default();
                     if let Some(raw_bytes) = self.win32_input_mode_key_record_raw_bytes(record) {
@@ -471,12 +987,15 @@ impl WindowsInputMapper {
                             paste_bytes: bytes,
                             raw_bytes,
                             win32_paste_bytes,
+                            nested_record: record,
                         });
                     } else {
+                        let oem_char = resolve_ctrl_oem_char(record);
                         items.push(PlatformInputItem::PasteAwareKey {
                             bytes,
                             win32_paste_bytes,
-                            events: self.translate_semantic_key_events(record),
+                            events: self.translate_semantic_key_events(record, oem_char),
+                            nested_record: Some(record),
                         })
                     }
                 }
@@ -489,7 +1008,7 @@ impl WindowsInputMapper {
         &mut self,
         record: WindowsKeyRecord,
     ) -> Option<Vec<u8>> {
-        if self.key_record_is_raw_escape(record) {
+        if Self::raw_escape_origin(record).is_some() {
             return Some(vec![0x1b]);
         }
 
@@ -556,6 +1075,7 @@ impl WindowsInputMapper {
     fn translate_semantic_key_events(
         &mut self,
         key: WindowsKeyRecord,
+        oem_char: Option<char>,
     ) -> Vec<crate::protocol::ClientInputEvent> {
         if !self.key_record_can_emit_event(key) {
             return Vec::new();
@@ -580,22 +1100,33 @@ impl WindowsInputMapper {
             && !is_alt_code
             && !(0xd800..=0xdfff).contains(&key.unicode);
         if carries_native_record {
+            let kind = Self::semantic_key_kind(key, is_alt_code, 0);
             return self
-                .translate_semantic_key_event(key, Self::semantic_key_kind(key, is_alt_code, 0))
+                .translate_semantic_key_event(key, kind, oem_char)
                 .map(|event| match event {
                     crate::protocol::ClientInputEvent::Key {
                         code,
                         modifiers,
                         kind,
+                        generated_text,
                         ..
-                    } => crate::protocol::ClientInputEvent::Key {
-                        code,
-                        modifiers,
-                        kind,
-                        repeat_count: key.repeat_count.max(1),
-                        generated_text: None,
-                        source: crate::protocol::ClientKeySource::WindowsConsole { record: key },
-                    },
+                    } => {
+                        // Windows Unicode is the authoritative host-layout result. Plain and
+                        // AltGr characters already encode from `code`; Shift must remain on the
+                        // physical event, so carry its produced text separately.
+                        let shifted_text = key.key_down
+                            && modifiers == crossterm::event::KeyModifiers::SHIFT.bits();
+                        crate::protocol::ClientInputEvent::Key {
+                            code,
+                            modifiers,
+                            kind,
+                            repeat_count: key.repeat_count.max(1),
+                            generated_text: if shifted_text { generated_text } else { None },
+                            source: crate::protocol::ClientKeySource::WindowsConsole {
+                                record: key,
+                            },
+                        }
+                    }
                     event => event,
                 })
                 .into_iter()
@@ -607,6 +1138,7 @@ impl WindowsInputMapper {
                 self.translate_semantic_key_event(
                     key,
                     Self::semantic_key_kind(key, is_alt_code, repeat_idx),
+                    oem_char,
                 )
             })
             .collect()
@@ -648,8 +1180,9 @@ impl WindowsInputMapper {
         &mut self,
         key: WindowsKeyRecord,
         kind: crate::protocol::ClientKeyKind,
+        oem_char: Option<char>,
     ) -> Option<crate::protocol::ClientInputEvent> {
-        let modifiers = windows_key_modifiers(key.control_key_state);
+        let modifiers = windows_record_modifiers(key);
         if key.virtual_key_code == 0 {
             let codepoint = self.utf16_unit_to_char(key.unicode)?;
             if !codepoint.is_control() {
@@ -683,8 +1216,10 @@ impl WindowsInputMapper {
             if key.unicode == 0 {
                 self.pending_high_surrogate = None;
             }
-            if modifiers.contains(crossterm::event::KeyModifiers::CONTROL) {
-                if let Some(code) = windows_unicode_control_to_key_code(key.unicode) {
+            if modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+                && !(0x30..=0x39).contains(&key.virtual_key_code)
+            {
+                if let Some(code) = ctrl_key_code(key.virtual_key_code, key.unicode, oem_char) {
                     self.pending_high_surrogate = None;
                     return Some(crate::protocol::ClientInputEvent::Key {
                         code,
@@ -703,6 +1238,7 @@ impl WindowsInputMapper {
                 .or_else(|| {
                     windows_virtual_key_to_char_code(key.virtual_key_code, key.unicode, modifiers)
                 })
+                .or_else(|| oem_char.map(crate::protocol::ClientKeyCode::Char))
         };
 
         code.map(|code| {
@@ -1004,36 +1540,58 @@ fn windows_virtual_key_to_char_code(
     Some(ClientKeyCode::Char(ch))
 }
 
-fn windows_unicode_control_to_key_code(unicode: u16) -> Option<crate::protocol::ClientKeyCode> {
+fn ctrl_key_code(vk: u16, u: u16, oem: Option<char>) -> Option<crate::protocol::ClientKeyCode> {
     use crate::protocol::ClientKeyCode;
-    Some(match unicode {
-        0x00 => ClientKeyCode::Char(' '),
-        0x1b => ClientKeyCode::Char('['),
-        0x1c => ClientKeyCode::Char('\\'),
-        0x1d => ClientKeyCode::Char(']'),
-        0x1e => ClientKeyCode::Char('^'),
-        0x1f => ClientKeyCode::Char('-'),
+    Some(match (vk, u) {
+        (0xbf, 0x00) => ClientKeyCode::Char(oem?),
+        // Keep Ctrl+Break and Ctrl+Space mappings. Other physical keys carrying
+        // Unicode zero are not evidence of a Space character.
+        (0x03 | 0x20, 0x00) => ClientKeyCode::Char(' '),
+        (_, 0x1b) => ClientKeyCode::Char('['),
+        (_, 0x1c) => ClientKeyCode::Char('\\'),
+        (_, 0x1d) => ClientKeyCode::Char(']'),
+        (_, 0x1e) => ClientKeyCode::Char('^'),
+        (_, 0x1f) => ClientKeyCode::Char('-'),
         _ => return None,
     })
 }
 
-#[cfg(windows)]
-fn send_windows_client_input_events(
-    events: Vec<crate::protocol::ClientInputEvent>,
-    event_tx: &mpsc::Sender<ClientLoopEvent>,
-) -> bool {
-    if events.is_empty() {
-        return true;
+/// Punctuation keys report no character under Ctrl or a non-producing AltGr.
+/// Ask the current layout which key it is so the record is still forwarded.
+fn resolve_ctrl_oem_char(key: WindowsKeyRecord) -> Option<char> {
+    if is_oem_virtual_key(key.virtual_key_code) && key.unicode == 0 {
+        #[cfg(windows)]
+        return crate::platform::resolve_base_printable_key(
+            key.virtual_key_code,
+            key.virtual_scan_code,
+        );
     }
-    if windows_input_trace_enabled() {
-        tracing::info!(?events, "windows input trace: client input events");
-    }
-    event_tx
-        .blocking_send(ClientLoopEvent::StdinEvents(events))
-        .is_ok()
+    None
 }
 
-#[cfg(any(windows, test))]
+fn is_oem_virtual_key(vk: u16) -> bool {
+    matches!(vk, 0xba..=0xc0 | 0xdb..=0xdf | 0xe2)
+}
+
+/// Modifiers for a key record. AltGr is a character shift on character keys
+/// (which may also be dead keys that report no character yet, #3948). On keys
+/// that never type a character it is the Ctrl+Alt chord Windows reports.
+fn windows_record_modifiers(key: WindowsKeyRecord) -> crossterm::event::KeyModifiers {
+    const RIGHT_ALT_PRESSED: u32 = 0x0001;
+    const LEFT_CTRL_PRESSED: u32 = 0x0008;
+    let modifiers = windows_key_modifiers(key.control_key_state);
+    let alt_gr = key.control_key_state & (RIGHT_ALT_PRESSED | LEFT_CTRL_PRESSED)
+        == (RIGHT_ALT_PRESSED | LEFT_CTRL_PRESSED);
+    let character_key = matches!(key.virtual_key_code, 0x30..=0x39 | 0x41..=0x5a)
+        || is_oem_virtual_key(key.virtual_key_code);
+    if alt_gr && key.unicode == 0 && !character_key {
+        modifiers | crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT
+    } else {
+        modifiers
+    }
+}
+
+#[cfg(windows)]
 fn windows_input_trace_enabled() -> bool {
     std::env::var_os("HERDR_WINDOWS_INPUT_TRACE").is_some()
 }
@@ -1041,6 +1599,217 @@ fn windows_input_trace_enabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn host_default_color_replies_reach_shell_without_pane_input() {
+        use crate::protocol::{
+            ClientHostColor, ClientHostDefaultColorKind, ClientHostThemeUpdate, ClientMessage,
+        };
+
+        let mut translator = WindowsInputTranslator::default();
+        translator
+            .pump
+            .framer
+            .host_default_color_query_sent(std::time::Duration::from_secs(1));
+        assert!(translator.translate(key_char('\x1b')).is_empty());
+        for _ in 0..3 {
+            assert!(translator.idle().is_empty());
+        }
+        assert!(matches!(
+            translator
+                .translate(key_vk_with_unicode(0x41, 'a', 0))
+                .as_slice(),
+            [crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('a'),
+                ..
+            }]
+        ));
+
+        let events = "]10;rgb:aaaa/bbbb/cccc\x1b\\\x1b]11;rgb:1111/2222/3333\x1b\\"
+            .chars()
+            .map(key_char)
+            .flat_map(|record| translator.translate(record))
+            .collect::<Vec<_>>();
+        let mut shell = crate::client::shell::ClientShellState::new(
+            crate::client::shell::ClientShellConfig::from_config(&crate::config::Config::default()),
+        );
+        let outcome = shell.handle_client_events(&events);
+        assert_eq!(
+            outcome.requests,
+            vec![
+                ClientMessage::ClientShellHostTheme {
+                    update: ClientHostThemeUpdate::DefaultColor {
+                        kind: ClientHostDefaultColorKind::Foreground,
+                        color: ClientHostColor {
+                            r: 0xaa,
+                            g: 0xbb,
+                            b: 0xcc,
+                        },
+                    },
+                },
+                ClientMessage::ClientShellHostTheme {
+                    update: ClientHostThemeUpdate::DefaultColor {
+                        kind: ClientHostDefaultColorKind::Background,
+                        color: ClientHostColor {
+                            r: 0x11,
+                            g: 0x22,
+                            b: 0x33,
+                        },
+                    },
+                },
+            ]
+        );
+        assert!(outcome.actions.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ctrl_bracket_precedes_next_key_while_host_color_reply_is_pending() {
+        let mut translator = WindowsInputTranslator::default();
+        translator
+            .pump
+            .framer
+            .host_default_color_query_sent(std::time::Duration::from_secs(1));
+        assert!(translator
+            .translate(key_vk_with_utf16_mods(0xdb, 0x1b, 0x0008))
+            .is_empty());
+        let events = translator.translate(key_vk_with_unicode(0x0d, '\r', 0));
+        assert!(matches!(
+            events.as_slice(),
+            [
+                crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Esc,
+                    ..
+                },
+                crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Enter,
+                    ..
+                }
+            ]
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn ctrl_bracket_idle_does_not_cancel_later_host_color_reply() {
+        let mut translator = WindowsInputTranslator::default();
+        translator
+            .pump
+            .framer
+            .host_default_color_query_sent(std::time::Duration::from_secs(1));
+        assert!(translator
+            .translate(key_vk_with_utf16_mods(0xdb, 0x1b, 0x0008))
+            .is_empty());
+        assert!(matches!(
+            translator.idle().as_slice(),
+            [crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Esc,
+                ..
+            }]
+        ));
+        assert!(translator.translate(key_char('\x1b')).is_empty());
+        assert!(translator.idle().is_empty());
+        let events = "]10;rgb:aaaa/bbbb/cccc\x1b\\"
+            .chars()
+            .map(key_char)
+            .flat_map(|record| translator.translate(record))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            events.as_slice(),
+            [crate::protocol::ClientInputEvent::HostDefaultColor {
+                kind: crate::protocol::ClientHostDefaultColorKind::Foreground,
+                ..
+            }]
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn serialized_host_reply_escape_survives_intervening_key() {
+        let mut translator = WindowsInputTranslator::default();
+        translator
+            .pump
+            .framer
+            .host_default_color_query_sent(std::time::Duration::from_secs(1));
+        for record in win32_input_mode_encoded_raw_bytes(b"\x1b") {
+            assert!(translator.translate(record).is_empty());
+        }
+        let key_events = translator.translate(key_vk_with_unicode(0x0d, '\r', 0));
+        assert!(matches!(
+            key_events.as_slice(),
+            [crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Enter,
+                ..
+            }]
+        ));
+        let events = "]10;rgb:aaaa/bbbb/cccc\x1b\\"
+            .chars()
+            .map(key_char)
+            .flat_map(|record| translator.translate(record))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            events.as_slice(),
+            [crate::protocol::ClientInputEvent::HostDefaultColor {
+                kind: crate::protocol::ClientHostDefaultColorKind::Foreground,
+                ..
+            }]
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn expired_host_color_reply_tail_does_not_swallow_semantic_key() {
+        let mut translator = WindowsInputTranslator::default();
+        translator
+            .pump
+            .framer
+            .host_default_color_query_sent(std::time::Duration::ZERO);
+        for record in "\x1b]11;rgb:1111/".chars().map(key_char) {
+            assert!(translator.translate(record).is_empty());
+        }
+        assert!(translator.idle().is_empty());
+        assert!(matches!(
+            translator
+                .translate(key_vk_with_unicode(0x0d, '\r', 0))
+                .as_slice(),
+            [crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Enter,
+                ..
+            }]
+        ));
+        for record in "2222/3333\x1b\\".chars().map(key_char) {
+            assert!(translator.translate(record).is_empty());
+        }
+        assert!(matches!(
+            translator
+                .translate(key_vk_with_unicode(0x41, 'a', 0))
+                .as_slice(),
+            [crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('a'),
+                ..
+            }]
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unanswered_host_color_query_stops_holding_escape() {
+        let mut translator = WindowsInputTranslator::default();
+        translator
+            .pump
+            .framer
+            .host_default_color_query_sent(std::time::Duration::from_millis(1));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(translator.translate(key_char('\x1b')).is_empty());
+        assert!(matches!(
+            translator.idle().as_slice(),
+            [crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Esc,
+                ..
+            }]
+        ));
+    }
 
     fn key_char(ch: char) -> WindowsInputRecord {
         WindowsInputRecord::Key(WindowsKeyRecord {
@@ -1251,6 +2020,146 @@ mod tests {
     }
 
     #[test]
+    fn vti_ctrl_win_does_not_emit_ctrl_space() {
+        // Exact host sequences captured in issue #4470: Ctrl down, Win down,
+        // Ctrl up, Win up. Non-text keys must not become the Space prefix.
+        let input =
+            "\x1b[17;29;0;1;8;1_\x1b[91;91;0;1;264;1_\x1b[17;29;0;0;0;1_\x1b[91;91;0;0;256;1_";
+        let mut translator = WindowsInputTranslator::default();
+        let events: Vec<_> = input
+            .chars()
+            .flat_map(|ch| translator.translate(key_char(ch)))
+            .collect();
+        assert!(events.is_empty(), "unexpected input events: {events:?}");
+        assert!(translator.idle().is_empty());
+
+        // Ignoring the chord must not consume or defer the following input.
+        for record in [key_char('c'), key_vk_with_utf16_mods(0x20, 0, 0x0008)] {
+            assert_eq!(
+                translator.translate(record),
+                translate_with_provenance([record])
+            );
+        }
+        assert!(translator.idle().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_input_trace_preserves_mapped_event_groups() {
+        let groups = vec![
+            vec![crate::protocol::ClientInputEvent::FocusGained],
+            vec![
+                crate::protocol::ClientInputEvent::FocusLost,
+                crate::protocol::ClientInputEvent::FocusGained,
+            ],
+        ];
+        let mut trace = WindowsInputTraceBatch::default();
+        let mut handoff = WindowsInputHandoff::default();
+
+        for events in &groups {
+            push_platform_input_events(events.clone(), &mut handoff, Some(&mut trace));
+        }
+        push_platform_input_events(Vec::new(), &mut handoff, Some(&mut trace));
+
+        assert_eq!(trace.mapped_event_groups, groups);
+        assert_eq!(handoff.pending, VecDeque::from(groups));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_input_handoff_keeps_input_while_the_client_queue_is_full() {
+        use crate::protocol::{
+            ClientInputEvent, ClientKeyCode, ClientKeyKind, ClientKeySource, ClientMouseButton,
+            ClientMouseKind,
+        };
+
+        let mouse = |kind, column| ClientInputEvent::Mouse {
+            kind,
+            column,
+            row: 4,
+            modifiers: 0,
+        };
+        let down = mouse(ClientMouseKind::Down(ClientMouseButton::Left), 1);
+        let last_move = mouse(ClientMouseKind::Moved, 12);
+        let last_drag = mouse(ClientMouseKind::Drag(ClientMouseButton::Left), 9);
+        let scroll = mouse(ClientMouseKind::ScrollDown, 9);
+        let up = mouse(ClientMouseKind::Up(ClientMouseButton::Left), 9);
+        let shortcut = |kind| ClientInputEvent::Key {
+            code: ClientKeyCode::Char('v'),
+            modifiers: crossterm::event::KeyModifiers::CONTROL.bits(),
+            kind,
+            repeat_count: 1,
+            generated_text: None,
+            source: ClientKeySource::Synthesized,
+        };
+        let shortcut_press = shortcut(ClientKeyKind::Press);
+        let shortcut_release = shortcut(ClientKeyKind::Release);
+        let text = ClientInputEvent::TextCommit("5;37;15M".into());
+
+        let (event_tx, mut event_rx) = mpsc::channel(1);
+        event_tx.try_send(ClientLoopEvent::Timer).unwrap();
+        let mut handoff = WindowsInputHandoff::default();
+        for event in [
+            mouse(ClientMouseKind::Moved, 10),
+            last_move.clone(),
+            down.clone(),
+            mouse(ClientMouseKind::Drag(ClientMouseButton::Left), 2),
+            mouse(ClientMouseKind::Drag(ClientMouseButton::Left), 5),
+            last_drag.clone(),
+            scroll.clone(),
+            up.clone(),
+            shortcut_press.clone(),
+            shortcut_release.clone(),
+            text.clone(),
+        ] {
+            handoff.push(vec![event]);
+        }
+
+        assert!(handoff.try_flush(&event_tx));
+        let expected = vec![
+            last_move,
+            down,
+            last_drag,
+            scroll,
+            up,
+            shortcut_press,
+            shortcut_release,
+            text,
+        ];
+        assert_eq!(
+            handoff.pending,
+            expected
+                .iter()
+                .cloned()
+                .map(|event| vec![event])
+                .collect::<VecDeque<_>>()
+        );
+        assert!(matches!(event_rx.try_recv(), Ok(ClientLoopEvent::Timer)));
+
+        let mut delivered = Vec::new();
+        let mut shortcut_preserved = false;
+        while !handoff.pending.is_empty() {
+            assert!(handoff.try_flush(&event_tx));
+            let Ok(ClientLoopEvent::StdinEvents(events)) = event_rx.try_recv() else {
+                panic!("expected retained Windows input events");
+            };
+            assert_eq!(events.len(), 1, "logical input batches must stay separate");
+            shortcut_preserved |=
+                crate::client::clipboard_images::should_bridge_clipboard_image_events(
+                    &events,
+                    true,
+                    Some((
+                        crossterm::event::KeyCode::Char('v'),
+                        crossterm::event::KeyModifiers::CONTROL,
+                    )),
+                );
+            delivered.extend(events);
+        }
+        assert_eq!(delivered, expected);
+        assert!(shortcut_preserved);
+    }
+
+    #[test]
     fn vti_bracketed_paste_records_emit_single_paste() {
         let records = "\x1b[200~alpha\rbravo\rcharlie\x1b[201~"
             .chars()
@@ -1274,6 +2183,151 @@ mod tests {
             translate(records),
             vec![crate::protocol::ClientInputEvent::Paste {
                 text: "About\ragent multiplexer that lives in your terminal.".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn vti_reported_wezterm_paste_preserves_clipboard_text() {
+        // Exact raw Unicode fields from #4725, comments 5877227755/5877228192.
+        // All records have the other fields supplied by key_char. Preserve the
+        // seven paste batch boundaries and the preceding modifier records.
+        let batches = [
+            "\x1b[17;29;0;1;8;1_",
+            "\x1b[16;42;0;1;24;1_",
+            "\x1b[200~\x1b[65;30;97;1;0;1_\x1b[65;30;97;0;0;1_\x1b[76;38;108;1;0;1_\x1b[76;3",
+            "8;108;0;0;1_\x1b[80;25;112;1;0;1_\x1b[80;25;112;0;0;1_\x1b[72;35;104;1;0;",
+            "1_\x1b[72;35;104;0;0;1_\x1b[65;30;97;1;0;1_\x1b[65;30;97;0;0;1_\x1b[17;29;0;",
+            "1;8;1_\x1b[13;28;10;1;8;1_\x1b[13;28;10;0;8;1_\x1b[17;29;0;0;0;1_\x1b[66;48;",
+            "98;1;0;1_\x1b[66;48;98;0;0;1_\x1b[69;18;101;1;0;1_\x1b[69;18;101;0;0;1_\x1b[",
+            "84;20;116;1;0;1_\x1b[84;20;116;0;0;1_\x1b[65;30;97;1;0;1_\x1b[65;30;97;0;",
+            "0;1_\x1b[201~",
+        ];
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = Vec::new();
+        for batch in batches {
+            for record in batch.chars().map(key_char) {
+                events.extend(translator.translate(record));
+            }
+        }
+        assert_eq!(
+            events,
+            vec![crate::protocol::ClientInputEvent::Paste {
+                text: "alpha\nbeta".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn win32_paste_payload_rejects_incomplete_or_unsupported_records() {
+        const PAIR: &str = "\x1b[65;30;97;1;0;1_\x1b[65;30;97;0;0;1_";
+        for payload in [
+            format!("{PAIR}trailing text"),
+            format!("{PAIR}\x1b[65;30;97;1;0;"),
+            "\x1b[65;30;97;1;0;1_".into(),
+            "\x1b[65;30;97;0;0;1_".into(),
+            "\x1b[65;30;97;1;0;1_\x1b[66;48;98;0;0;1_".into(),
+            PAIR.replace(";97;1;", ";97;2;"),
+            PAIR.replace(";0;1_", ";0;0_"),
+            PAIR.replace(";0;1_", ";0;65535_"),
+            PAIR.replace(";97;", ";65536;"),
+            PAIR.replace(";97;", ";+97;"),
+            PAIR.replace(";97;", ";0;"),
+            PAIR.replace(";97;", ";55296;"),
+            "\x1b[17;29;0;1;8;1_\x1b[17;29;0;0;0;1_".into(),
+        ] {
+            assert_eq!(decode_win32_paste_payload(&payload), None, "{payload:?}");
+        }
+    }
+
+    fn serialized_paste_text(text: &str) -> String {
+        text.encode_utf16()
+            .map(|unit| format!("\x1b[0;0;{unit};1;0;1_\x1b[0;0;{unit};0;0;1_"))
+            .collect()
+    }
+
+    #[test]
+    fn vti_raw_win32_paste_keeps_decoded_controls_as_text_and_surrogates_local() {
+        let text = "😀\x1b[201~\x1b[<0;1;1M";
+        let high = "\x1b[0;0;55357;1;0;1_\x1b[0;0;55357;0;0;1_";
+        let low = "\x1b[0;0;56832;1;0;1_\x1b[0;0;56832;0;0;1_";
+        let payloads = [
+            serialized_paste_text(text),
+            high.into(),
+            low.into(),
+            "plain".into(),
+        ];
+        let mut translator = WindowsInputTranslator::default();
+        let mut events = Vec::new();
+        for payload in payloads {
+            for record in format!("\x1b[200~{payload}\x1b[201~").chars().map(key_char) {
+                events.extend(translator.translate(record));
+            }
+            events.extend(translator.idle());
+        }
+        assert_eq!(
+            events,
+            [text, high, low, "plain"]
+                .into_iter()
+                .map(|text| crate::protocol::ClientInputEvent::Paste { text: text.into() })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn vti_encoded_paste_preserves_reports_then_raw_paste_decodes() {
+        let text = serialized_paste_text("a");
+        let framed = format!("\x1b[200~{text}\x1b[201~");
+        let mut records = win32_input_mode_encoded_key_bytes(framed.as_bytes());
+        records.extend(framed.chars().map(key_char));
+        assert_eq!(
+            translate(records),
+            vec![
+                crate::protocol::ClientInputEvent::Paste { text },
+                crate::protocol::ClientInputEvent::Paste { text: "a".into() },
+            ]
+        );
+    }
+
+    #[test]
+    fn vti_remote_bracketed_paste_decodes_reported_enter_records() {
+        let records = concat!(
+            "\x1b[200~ - line one",
+            "\x1b[13;28;13;1;0;1_\x1b[13;28;13;0;0;1_",
+            "  - line two",
+            "\x1b[13;28;13;1;0;1_\x1b[13;28;13;0;0;1_",
+            "  - line three\x1b[201~",
+        )
+        .chars()
+        .map(key_char);
+
+        assert_eq!(
+            translate(records),
+            vec![crate::protocol::ClientInputEvent::Paste {
+                text: " - line one\r  - line two\r  - line three".into(),
+            }]
+        );
+    }
+
+    #[test]
+    fn vti_remote_paste_keeps_incomplete_enter_report_pairs_opaque() {
+        let records = concat!(
+            "\x1b[200~before",
+            "\x1b[13;28;13;1;0;1_middle\x1b[13;28;13;0;0;1_",
+            "after\x1b[201~",
+        )
+        .chars()
+        .map(key_char);
+
+        assert_eq!(
+            translate(records),
+            vec![crate::protocol::ClientInputEvent::Paste {
+                text: concat!(
+                    "before",
+                    "\x1b[13;28;13;1;0;1_middle\x1b[13;28;13;0;0;1_",
+                    "after",
+                )
+                .into(),
             }]
         );
     }
@@ -1426,12 +2480,14 @@ mod tests {
     }
 
     #[test]
-    fn vti_real_non_letter_control_records_are_preserved() {
+    fn vti_control_records_keep_physical_digit_identity() {
         let cases = [
+            (0x03, 0x00, ' '),
             (0x20, 0x00, ' '),
+            (0x31, 0x00, '1'),
             (0xdc, 0x1c, '\\'),
             (0xdd, 0x1d, ']'),
-            (0x36, 0x1e, '^'),
+            (0x36, 0x1e, '6'),
             (0xbd, 0x1f, '-'),
         ];
 
@@ -1450,6 +2506,44 @@ mod tests {
                 "vk={vk:#x} unicode={unicode:#x}"
             );
         }
+    }
+
+    #[test]
+    fn vti_ctrl_oem_record_uses_resolved_layout_character() {
+        let pressed = WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 0xbf,
+            virtual_scan_code: 0x35,
+            unicode: 0,
+            control_key_state: 0x0028,
+        };
+        let released = WindowsKeyRecord {
+            key_down: false,
+            ..pressed
+        };
+        let mut mapper = WindowsInputMapper::default();
+        let expected = |record, kind, ch| crate::protocol::ClientInputEvent::Key {
+            code: crate::protocol::ClientKeyCode::Char(ch),
+            modifiers: crossterm::event::KeyModifiers::CONTROL.bits(),
+            kind,
+            repeat_count: 1,
+            generated_text: None,
+            source: crate::protocol::ClientKeySource::WindowsConsole { record },
+        };
+        for (record, kind, ch) in [
+            (pressed, crate::protocol::ClientKeyKind::Press, '/'),
+            (released, crate::protocol::ClientKeyKind::Release, '/'),
+            (pressed, crate::protocol::ClientKeyKind::Press, 'ß'),
+        ] {
+            assert_eq!(
+                mapper.translate_semantic_key_events(record, Some(ch)),
+                [expected(record, kind, ch)]
+            );
+        }
+        assert!(mapper
+            .translate_semantic_key_events(pressed, None)
+            .is_empty());
     }
 
     #[test]
@@ -1493,26 +2587,71 @@ mod tests {
     }
 
     #[test]
-    fn vti_physical_escape_key_record_is_immediately_semantic() {
-        let record = WindowsKeyRecord {
-            key_down: true,
-            repeat_count: 1,
-            virtual_key_code: 0x1b,
-            virtual_scan_code: 0x01,
-            unicode: 0x1b,
-            control_key_state: 0,
-        };
-        assert_eq!(
-            translate_with_provenance([WindowsInputRecord::Key(record)]),
-            vec![crate::protocol::ClientInputEvent::Key {
-                code: crate::protocol::ClientKeyCode::Esc,
-                modifiers: 0,
-                kind: crate::protocol::ClientKeyKind::Press,
+    fn vti_physical_escape_key_record_keeps_native_ownership_after_idle() {
+        for record in [
+            WindowsKeyRecord {
+                key_down: true,
                 repeat_count: 1,
-                generated_text: None,
-                source: crate::protocol::ClientKeySource::WindowsConsole { record },
+                virtual_key_code: 0x1b,
+                virtual_scan_code: 0x01,
+                unicode: 0x1b,
+                control_key_state: 0,
+            },
+            WindowsKeyRecord {
+                key_down: true,
+                repeat_count: 1,
+                virtual_key_code: 0x1b,
+                virtual_scan_code: 0x02,
+                unicode: 0,
+                control_key_state: 0,
+            },
+        ] {
+            let mut translator = WindowsInputTranslator::default();
+            #[cfg(windows)]
+            translator
+                .pump
+                .framer
+                .host_default_color_query_sent(std::time::Duration::from_secs(1));
+            assert!(translator
+                .translate(WindowsInputRecord::Key(record))
+                .is_empty());
+            assert_eq!(
+                translator.idle(),
+                vec![crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Esc,
+                    modifiers: 0,
+                    kind: crate::protocol::ClientKeyKind::Press,
+                    repeat_count: 1,
+                    generated_text: None,
+                    source: crate::protocol::ClientKeySource::WindowsConsole { record },
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn vti_physical_escape_flushes_older_raw_escape_first() {
+        let physical_escape = key_vk_with_scan_unicode(0x1b, 0x01, '\x1b', 0);
+        let mut translator = WindowsInputTranslator::default();
+        assert!(translator
+            .translate(key_vk_with_scan_unicode(0x1b, 0, '\0', 0))
+            .is_empty());
+        assert!(matches!(
+            translator.translate(physical_escape).as_slice(),
+            [crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Esc,
+                source: crate::protocol::ClientKeySource::Vt { .. },
+                ..
             }]
-        );
+        ));
+        assert!(matches!(
+            translator.idle().as_slice(),
+            [crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Esc,
+                source: crate::protocol::ClientKeySource::WindowsConsole { .. },
+                ..
+            }]
+        ));
     }
 
     #[test]
@@ -1540,14 +2679,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             [(Press, 3, true, 3), (Release, 1, false, 1)]
         );
-    }
-
-    #[test]
-    fn vti_ctrl_break_record_keeps_semantic_path() {
-        assert!(matches!(
-            translate_with_provenance([key_vk(0x03, 0x0008)]).as_slice(),
-            [crate::protocol::ClientInputEvent::Key { .. }]
-        ));
     }
 
     #[test]
@@ -2026,6 +3157,318 @@ mod tests {
     }
 
     #[test]
+    fn altgr_is_ctrl_alt_only_on_keys_that_never_type_characters() {
+        let altgr = |virtual_key_code: u16, unicode: u16| WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code,
+            virtual_scan_code: 0,
+            unicode,
+            control_key_state: 0x0009,
+        };
+        let ctrl_alt =
+            crossterm::event::KeyModifiers::CONTROL | crossterm::event::KeyModifiers::ALT;
+
+        // PageUp and Space type nothing: the chord must not look like a plain key.
+        assert_eq!(windows_record_modifiers(altgr(0x21, 0)), ctrl_alt);
+        assert_eq!(windows_record_modifiers(altgr(0x20, 0)), ctrl_alt);
+        // Character keys keep AltGr as a character shift, dead keys included.
+        assert!(windows_record_modifiers(altgr(0x34, 0)).is_empty());
+        assert!(windows_record_modifiers(altgr(0xba, 0)).is_empty());
+        assert!(windows_record_modifiers(altgr(0x51, u16::from(b'@'))).is_empty());
+    }
+
+    #[test]
+    fn vti_altgr_dead_key_preserves_native_record_without_command_modifiers() {
+        // AltGr+4 press captured in #3948, Spanish ISO layout.
+        let record = WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 52,
+            virtual_scan_code: 5,
+            unicode: 0,
+            control_key_state: 9,
+        };
+        let events = translate_with_provenance(win32_input_mode_encoded_record(record));
+        assert_eq!(
+            events,
+            vec![crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('4'),
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Press,
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::WindowsConsole { record },
+            }]
+        );
+    }
+
+    #[test]
+    fn vti_us_international_dead_key_only_emits_composed_text() {
+        fn encode_for_kitty(events: Vec<crate::protocol::ClientInputEvent>, flags: u16) -> Vec<u8> {
+            events
+                .into_iter()
+                .flat_map(|event| match event.to_raw_input_event() {
+                    crate::raw_input::RawInputEvent::Key(key) => {
+                        crate::pane::test_encode_key_for_app(
+                            format!("\x1b[>{flags}u").as_bytes(),
+                            key,
+                        )
+                    }
+                    crate::raw_input::RawInputEvent::Text(text) => {
+                        text.as_str().as_bytes().to_vec()
+                    }
+                    _ => panic!("unexpected event while encoding dead-key input"),
+                })
+                .collect()
+        }
+
+        let dead_press = WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 0x36,
+            virtual_scan_code: 0x07,
+            unicode: 0,
+            control_key_state: 0x0030,
+        };
+        let dead_release = WindowsKeyRecord {
+            key_down: false,
+            ..dead_press
+        };
+        let composed_press = WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 0x45,
+            virtual_scan_code: 0x12,
+            unicode: 'ê' as u16,
+            control_key_state: 0x0020,
+        };
+        let composed_release = WindowsKeyRecord {
+            key_down: false,
+            unicode: 'e' as u16,
+            ..composed_press
+        };
+
+        let mut translator = WindowsInputTranslator::default();
+        for (record, kind) in [
+            (dead_press, crate::protocol::ClientKeyKind::Press),
+            (dead_release, crate::protocol::ClientKeyKind::Release),
+        ] {
+            let events = translator.translate(WindowsInputRecord::Key(record));
+            assert!(matches!(
+                events.as_slice(),
+                [crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Char('6'),
+                    modifiers,
+                    kind: actual_kind,
+                    generated_text: None,
+                    source: crate::protocol::ClientKeySource::WindowsConsole {
+                        record: actual_record,
+                    },
+                    ..
+                }] if *modifiers == crossterm::event::KeyModifiers::SHIFT.bits()
+                    && *actual_kind == kind
+                    && *actual_record == record
+            ));
+            for flags in [1, 31] {
+                assert!(encode_for_kitty(events.clone(), flags).is_empty());
+            }
+        }
+
+        let events = translator.translate(WindowsInputRecord::Key(composed_press));
+        assert!(matches!(
+            events.as_slice(),
+            [crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('ê'),
+                kind: crate::protocol::ClientKeyKind::Press,
+                source: crate::protocol::ClientKeySource::WindowsConsole {
+                    record: actual_record,
+                },
+                ..
+            }] if *actual_record == composed_press
+        ));
+        assert_eq!(encode_for_kitty(events, 1), "ê".as_bytes());
+
+        let events = translator.translate(WindowsInputRecord::Key(composed_release));
+        assert!(encode_for_kitty(events, 1).is_empty());
+        assert!(translator.idle().is_empty());
+
+        let ordinary_shifted = WindowsKeyRecord {
+            unicode: '^' as u16,
+            ..dead_press
+        };
+        let events =
+            WindowsInputTranslator::default().translate(WindowsInputRecord::Key(ordinary_shifted));
+        assert_eq!(encode_for_kitty(events, 1), b"^");
+    }
+
+    #[test]
+    fn vti_win32_input_mode_non_us_shifted_text_preserves_generated_text() {
+        let pressed = WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 0x37,
+            virtual_scan_code: 0x08,
+            unicode: b'/'.into(),
+            control_key_state: 0x0010,
+        };
+        let released = WindowsKeyRecord {
+            key_down: false,
+            ..pressed
+        };
+        let mut records = win32_input_mode_encoded_record(pressed);
+        records.extend(win32_input_mode_encoded_record(released));
+
+        let events = translate_with_provenance(records);
+        assert_eq!(
+            events,
+            vec![
+                crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Char('/'),
+                    modifiers: crossterm::event::KeyModifiers::SHIFT.bits(),
+                    kind: crate::protocol::ClientKeyKind::Press,
+                    repeat_count: 1,
+                    generated_text: Some("/".into()),
+                    source: crate::protocol::ClientKeySource::WindowsConsole { record: pressed },
+                },
+                crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Char('/'),
+                    modifiers: crossterm::event::KeyModifiers::SHIFT.bits(),
+                    kind: crate::protocol::ClientKeyKind::Release,
+                    repeat_count: 1,
+                    generated_text: None,
+                    source: crate::protocol::ClientKeySource::WindowsConsole { record: released },
+                },
+            ]
+        );
+
+        let crate::raw_input::RawInputEvent::Key(key) = events[0].to_raw_input_event() else {
+            panic!("expected translated key");
+        };
+        assert_eq!(crate::pane::test_encode_key_for_app(b"", key.clone()), b"/");
+        assert_eq!(
+            crate::pane::test_encode_key_for_app(b"\x1b[>7u", key.clone()),
+            b"/"
+        );
+        assert_eq!(
+            crate::pane::test_encode_key_for_app(b"\x1b[>15u", key),
+            b"\x1b[47;2u"
+        );
+    }
+
+    #[test]
+    fn vti_native_layout_text_and_command_modifiers_encode_by_role() {
+        let cases = [
+            (
+                "plain unicode",
+                0x4c,
+                0x26,
+                'λ' as u16,
+                0,
+                0,
+                None,
+                "λ".as_bytes(),
+            ),
+            (
+                "shifted latin",
+                0x41,
+                0x1e,
+                'A' as u16,
+                0x0010,
+                crossterm::event::KeyModifiers::SHIFT.bits(),
+                Some("A"),
+                b"A".as_slice(),
+            ),
+            (
+                "shifted non-ascii",
+                0x4c,
+                0x26,
+                'Λ' as u16,
+                0x0010,
+                crossterm::event::KeyModifiers::SHIFT.bits(),
+                Some("Λ"),
+                "Λ".as_bytes(),
+            ),
+            (
+                "altgr",
+                0x45,
+                0x12,
+                '€' as u16,
+                0x0009,
+                0,
+                None,
+                "€".as_bytes(),
+            ),
+            (
+                "shift altgr",
+                0x37,
+                0x08,
+                '{' as u16,
+                0x0019,
+                crossterm::event::KeyModifiers::SHIFT.bits(),
+                Some("{"),
+                b"{".as_slice(),
+            ),
+            (
+                "left alt command",
+                0x41,
+                0x1e,
+                'a' as u16,
+                0x0002,
+                crossterm::event::KeyModifiers::ALT.bits(),
+                None,
+                b"\x1ba".as_slice(),
+            ),
+            (
+                "control command",
+                0x41,
+                0x1e,
+                0x01,
+                0x0008,
+                crossterm::event::KeyModifiers::CONTROL.bits(),
+                None,
+                b"\x01".as_slice(),
+            ),
+        ];
+
+        for (
+            name,
+            virtual_key_code,
+            virtual_scan_code,
+            unicode,
+            state,
+            modifiers,
+            text,
+            expected,
+        ) in cases
+        {
+            let events =
+                translate_with_provenance(win32_input_mode_encoded_record(WindowsKeyRecord {
+                    key_down: true,
+                    repeat_count: 1,
+                    virtual_key_code,
+                    virtual_scan_code,
+                    unicode,
+                    control_key_state: state,
+                }));
+            let [event] = events.as_slice() else {
+                panic!("{name}: expected one translated event, got {events:?}");
+            };
+            let crate::raw_input::RawInputEvent::Key(key) = event.to_raw_input_event() else {
+                panic!("{name}: expected translated key");
+            };
+
+            assert_eq!(key.modifiers.bits(), modifiers, "{name}: modifiers");
+            assert_eq!(key.generated_text.as_deref(), text, "{name}: text");
+            assert_eq!(
+                crate::pane::test_encode_key_for_app(b"", key),
+                expected,
+                "{name}: encoding"
+            );
+        }
+    }
+
+    #[test]
     fn vti_win32_input_mode_sequence_inside_bracketed_paste_stays_payload() {
         let records = "\x1b[200~alpha\x1b[13;28;13;1;16;1_bravo\x1b[201~"
             .chars()
@@ -2105,32 +3548,85 @@ mod tests {
     }
 
     #[test]
-    fn vti_nonzero_scan_escape_is_immediately_semantic() {
-        let mut translator = WindowsInputTranslator::default();
+    fn vti_physical_escape_prefix_still_parses_sgr_mouse_reports() {
+        let escape = key_vk_with_scan_unicode(0x1b, 0x01, '\x1b', 0);
+        let records = [escape]
+            .into_iter()
+            .chain("[<5;36;21M".chars().map(key_char))
+            .chain([escape])
+            .chain("[<5;76;28M".chars().map(key_char));
+
         assert_eq!(
-            translator.translate(key_vk_with_scan_unicode(0x1b, 0x02, '\0', 0)),
-            vec![crate::protocol::ClientInputEvent::Key {
-                code: crate::protocol::ClientKeyCode::Esc,
-                modifiers: 0,
-                kind: crate::protocol::ClientKeyKind::Press,
-                repeat_count: 1,
-                generated_text: None,
-                source: crate::protocol::ClientKeySource::WindowsConsole {
-                    record: WindowsKeyRecord {
-                        key_down: true,
-                        repeat_count: 1,
-                        virtual_key_code: 0x1b,
-                        virtual_scan_code: 0x02,
-                        unicode: 0,
-                        control_key_state: 0,
-                    }
+            translate(records),
+            vec![
+                crate::protocol::ClientInputEvent::Mouse {
+                    kind: crate::protocol::ClientMouseKind::Down(
+                        crate::protocol::ClientMouseButton::Middle,
+                    ),
+                    column: 35,
+                    row: 20,
+                    modifiers: crossterm::event::KeyModifiers::SHIFT.bits(),
                 },
-            }]
+                crate::protocol::ClientInputEvent::Mouse {
+                    kind: crate::protocol::ClientMouseKind::Down(
+                        crate::protocol::ClientMouseButton::Middle,
+                    ),
+                    column: 75,
+                    row: 27,
+                    modifiers: crossterm::event::KeyModifiers::SHIFT.bits(),
+                },
+            ]
         );
     }
 
     #[test]
-    fn vti_win32_input_mode_physical_escape_is_immediately_semantic() {
+    fn vti_physical_escape_and_open_bracket_remain_separate_keys() {
+        let escape = key_vk_with_scan_unicode(0x1b, 0x01, '\x1b', 0);
+        let mut translator = WindowsInputTranslator::default();
+        assert!(translator.translate(escape).is_empty());
+        assert!(translator.translate(key_char('[')).is_empty());
+        let events = translator.idle();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    crate::protocol::ClientInputEvent::Key {
+                        code: crate::protocol::ClientKeyCode::Esc,
+                        source: crate::protocol::ClientKeySource::WindowsConsole { .. },
+                        ..
+                    },
+                    crate::protocol::ClientInputEvent::Key {
+                        code: crate::protocol::ClientKeyCode::Char('['),
+                        ..
+                    }
+                ]
+            ),
+            "unexpected input events: {events:?}"
+        );
+    }
+
+    #[test]
+    fn vti_modified_physical_escape_stays_semantic_before_sgr_tail() {
+        let modified_escape = key_vk_with_scan_unicode(0x1b, 0x01, '\x1b', 0x0010);
+        let mut translator = WindowsInputTranslator::default();
+        let events = [modified_escape]
+            .into_iter()
+            .chain("[<0;20;10M".chars().map(key_char))
+            .flat_map(|record| translator.translate(record))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            events.first(),
+            Some(crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Esc,
+                modifiers,
+                source: crate::protocol::ClientKeySource::WindowsConsole { .. },
+                ..
+            }) if *modifiers == crossterm::event::KeyModifiers::SHIFT.bits()
+        ));
+    }
+
+    #[test]
+    fn vti_win32_input_mode_physical_escape_keeps_native_ownership_after_idle() {
         let record = WindowsKeyRecord {
             key_down: true,
             repeat_count: 1,
@@ -2142,11 +3638,13 @@ mod tests {
         let records = win32_input_mode_encoded_record(record);
         let mut translator = WindowsInputTranslator::default();
 
+        assert!(records
+            .into_iter()
+            .flat_map(|record| translator.translate(record))
+            .collect::<Vec<_>>()
+            .is_empty());
         assert_eq!(
-            records
-                .into_iter()
-                .flat_map(|record| translator.translate(record))
-                .collect::<Vec<_>>(),
+            translator.idle(),
             vec![crate::protocol::ClientInputEvent::Key {
                 code: crate::protocol::ClientKeyCode::Esc,
                 modifiers: 0,
@@ -2172,6 +3670,395 @@ mod tests {
     }
 
     #[test]
+    fn vti_win32_input_mode_encoded_default_mouse_sequence() {
+        // Exact inner Win32-input-mode records captured from Ghostty through
+        // Windows OpenSSH while moving the mouse, reported in issue #3735.
+        let records = concat!(
+            "\x1b[0;0;27;1;0;1_",
+            "\x1b[0;0;91;1;0;1_",
+            "\x1b[0;0;77;1;0;1_",
+            "\x1b[16;42;0;1;16;1_",
+            "\x1b[67;46;67;1;16;1_",
+            "\x1b[67;46;67;0;16;1_",
+            "\x1b[16;42;0;0;0;1_",
+            "\x1b[16;42;0;1;16;1_",
+            "\x1b[75;37;75;1;16;1_",
+            "\x1b[75;37;75;0;16;1_",
+            "\x1b[16;42;0;0;0;1_",
+            "\x1b[16;42;0;1;16;1_",
+            "\x1b[49;2;33;1;16;1_",
+            "\x1b[49;2;33;0;16;1_",
+            "\x1b[16;42;0;0;0;1_",
+        )
+        .chars()
+        .map(key_char);
+
+        let mut translator = WindowsInputTranslator::default();
+        let events = records
+            .flat_map(|record| translator.translate(record))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events,
+            vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                column: 42,
+                row: 0,
+                modifiers: 0,
+            }]
+        );
+        assert!(translator.idle().is_empty());
+        assert_eq!(
+            semantic_only(translator.translate(key_vk_with_unicode(0x58, 'x', 0))),
+            vec![crate::protocol::ClientInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Char('x'),
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Press,
+                repeat_count: 1,
+                generated_text: None,
+                source: crate::protocol::ClientKeySource::Synthesized,
+            }]
+        );
+    }
+
+    #[test]
+    fn vti_default_mouse_prefix_does_not_capture_native_shifted_key() {
+        let native_press = key_vk_with_scan_unicode(0x43, 0x2e, 'C', 0x0010);
+        let native_release = key_vk_up_with_scan_unicode(0x43, 0x2e, 'C', 0x0010);
+        let records = win32_input_mode_encoded_raw_bytes(b"\x1b[M")
+            .into_iter()
+            .chain([native_press, native_release]);
+
+        assert_eq!(
+            translate(records),
+            vec![
+                crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Char('C'),
+                    modifiers: crossterm::event::KeyModifiers::SHIFT.bits(),
+                    kind: crate::protocol::ClientKeyKind::Press,
+                    repeat_count: 1,
+                    generated_text: Some("C".into()),
+                    source: crate::protocol::ClientKeySource::Synthesized,
+                },
+                crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Char('C'),
+                    modifiers: crossterm::event::KeyModifiers::SHIFT.bits(),
+                    kind: crate::protocol::ClientKeyKind::Release,
+                    repeat_count: 1,
+                    generated_text: None,
+                    source: crate::protocol::ClientKeySource::Synthesized,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn vti_incomplete_default_mouse_restores_nested_key_on_idle() {
+        let shift_down = WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 0x10,
+            virtual_scan_code: 0x2a,
+            unicode: 0,
+            control_key_state: 0x0010,
+        };
+        let c_down = WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 0x43,
+            virtual_scan_code: 0x2e,
+            unicode: 'C' as u16,
+            control_key_state: 0x0010,
+        };
+        let mut records = win32_input_mode_encoded_raw_bytes(b"\x1b[M");
+        for record in [
+            shift_down,
+            c_down,
+            WindowsKeyRecord {
+                key_down: false,
+                ..c_down
+            },
+        ] {
+            records.extend(win32_input_mode_encoded_record(record));
+        }
+
+        let mut translator = WindowsInputTranslator::default();
+        assert!(records
+            .into_iter()
+            .flat_map(|record| translator.translate(record))
+            .collect::<Vec<_>>()
+            .is_empty());
+        assert_eq!(
+            semantic_only(translator.idle()),
+            vec![
+                crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Char('C'),
+                    modifiers: crossterm::event::KeyModifiers::SHIFT.bits(),
+                    kind: crate::protocol::ClientKeyKind::Press,
+                    repeat_count: 1,
+                    generated_text: Some("C".into()),
+                    source: crate::protocol::ClientKeySource::Synthesized,
+                },
+                crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Char('C'),
+                    modifiers: crossterm::event::KeyModifiers::SHIFT.bits(),
+                    kind: crate::protocol::ClientKeyKind::Release,
+                    repeat_count: 1,
+                    generated_text: None,
+                    source: crate::protocol::ClientKeySource::Synthesized,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn vti_invalid_default_mouse_restores_nested_key() {
+        let space_down = WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 0x20,
+            virtual_scan_code: 0x39,
+            unicode: ' ' as u16,
+            control_key_state: 0,
+        };
+        let mut records = win32_input_mode_encoded_raw_bytes(b"\x1b[MCK");
+        for record in [
+            space_down,
+            WindowsKeyRecord {
+                key_down: false,
+                ..space_down
+            },
+        ] {
+            records.extend(win32_input_mode_encoded_record(record));
+        }
+
+        assert_eq!(
+            translate(records),
+            vec![
+                crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Char(' '),
+                    modifiers: 0,
+                    kind: crate::protocol::ClientKeyKind::Press,
+                    repeat_count: 1,
+                    generated_text: None,
+                    source: crate::protocol::ClientKeySource::Synthesized,
+                },
+                crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Char(' '),
+                    modifiers: 0,
+                    kind: crate::protocol::ClientKeyKind::Release,
+                    repeat_count: 1,
+                    generated_text: None,
+                    source: crate::protocol::ClientKeySource::Synthesized,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn vti_all_zero_default_mouse_records_do_not_retain_key_identity() {
+        let records = win32_input_mode_encoded_raw_bytes(b"\x1b[MCK1\x1b[MCL1");
+
+        assert_eq!(
+            translate(records),
+            vec![
+                crate::protocol::ClientInputEvent::Mouse {
+                    kind: crate::protocol::ClientMouseKind::Moved,
+                    column: 42,
+                    row: 16,
+                    modifiers: 0,
+                },
+                crate::protocol::ClientInputEvent::Mouse {
+                    kind: crate::protocol::ClientMouseKind::Moved,
+                    column: 43,
+                    row: 16,
+                    modifiers: 0,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn vti_scan_zero_default_mouse_payload_suppresses_nested_release() {
+        let payload_down = WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 0x31,
+            virtual_scan_code: 0,
+            unicode: '1' as u16,
+            control_key_state: 0,
+        };
+        let mut records = win32_input_mode_encoded_raw_bytes(b"\x1b[MCK");
+        for record in [
+            payload_down,
+            WindowsKeyRecord {
+                key_down: false,
+                ..payload_down
+            },
+        ] {
+            records.extend(win32_input_mode_encoded_record(record));
+        }
+
+        assert_eq!(
+            translate(records),
+            vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                column: 42,
+                row: 16,
+                modifiers: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn vti_missing_mouse_payload_release_does_not_consume_next_press() {
+        let payload_down = WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 0x31,
+            virtual_scan_code: 0x02,
+            unicode: '!' as u16,
+            control_key_state: 0x0010,
+        };
+        let mut records = win32_input_mode_encoded_raw_bytes(b"\x1b[MCK");
+        for record in [
+            payload_down,
+            payload_down,
+            WindowsKeyRecord {
+                key_down: false,
+                ..payload_down
+            },
+        ] {
+            records.extend(win32_input_mode_encoded_record(record));
+        }
+
+        assert_eq!(
+            translate(records),
+            vec![
+                crate::protocol::ClientInputEvent::Mouse {
+                    kind: crate::protocol::ClientMouseKind::Moved,
+                    column: 42,
+                    row: 0,
+                    modifiers: 0,
+                },
+                crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Char('!'),
+                    modifiers: crossterm::event::KeyModifiers::SHIFT.bits(),
+                    kind: crate::protocol::ClientKeyKind::Press,
+                    repeat_count: 1,
+                    generated_text: Some("!".into()),
+                    source: crate::protocol::ClientKeySource::Synthesized,
+                },
+                crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Char('!'),
+                    modifiers: crossterm::event::KeyModifiers::SHIFT.bits(),
+                    kind: crate::protocol::ClientKeyKind::Release,
+                    repeat_count: 1,
+                    generated_text: None,
+                    source: crate::protocol::ClientKeySource::Synthesized,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn vti_repeated_default_mouse_payload_tracks_one_release() {
+        let payload_down = WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 0x43,
+            virtual_scan_code: 0x2e,
+            unicode: 'C' as u16,
+            control_key_state: 0x0010,
+        };
+        let payload_up = WindowsKeyRecord {
+            key_down: false,
+            ..payload_down
+        };
+        let mut records = win32_input_mode_encoded_raw_bytes(b"\x1b[M");
+        for record in [
+            payload_down,
+            payload_down,
+            payload_down,
+            payload_up,
+            payload_down,
+            payload_up,
+        ] {
+            records.extend(win32_input_mode_encoded_record(record));
+        }
+
+        assert_eq!(
+            translate(records),
+            vec![
+                crate::protocol::ClientInputEvent::Mouse {
+                    kind: crate::protocol::ClientMouseKind::Moved,
+                    column: 34,
+                    row: 34,
+                    modifiers: 0,
+                },
+                crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Char('C'),
+                    modifiers: crossterm::event::KeyModifiers::SHIFT.bits(),
+                    kind: crate::protocol::ClientKeyKind::Press,
+                    repeat_count: 1,
+                    generated_text: Some("C".into()),
+                    source: crate::protocol::ClientKeySource::Synthesized,
+                },
+                crate::protocol::ClientInputEvent::Key {
+                    code: crate::protocol::ClientKeyCode::Char('C'),
+                    modifiers: crossterm::event::KeyModifiers::SHIFT.bits(),
+                    kind: crate::protocol::ClientKeyKind::Release,
+                    repeat_count: 1,
+                    generated_text: None,
+                    source: crate::protocol::ClientKeySource::Synthesized,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn vti_default_mouse_release_survives_modifier_interleaving() {
+        let payload_down = WindowsKeyRecord {
+            key_down: true,
+            repeat_count: 1,
+            virtual_key_code: 0x31,
+            virtual_scan_code: 0x02,
+            unicode: '!' as u16,
+            control_key_state: 0x0010,
+        };
+        let shift_up = WindowsKeyRecord {
+            key_down: false,
+            repeat_count: 1,
+            virtual_key_code: 0x10,
+            virtual_scan_code: 0x2a,
+            unicode: 0,
+            control_key_state: 0,
+        };
+        let mut records = win32_input_mode_encoded_raw_bytes(b"\x1b[MCK");
+        for record in [
+            payload_down,
+            shift_up,
+            WindowsKeyRecord {
+                key_down: false,
+                unicode: '1' as u16,
+                control_key_state: 0,
+                ..payload_down
+            },
+        ] {
+            records.extend(win32_input_mode_encoded_record(record));
+        }
+
+        assert_eq!(
+            translate(records),
+            vec![crate::protocol::ClientInputEvent::Mouse {
+                kind: crate::protocol::ClientMouseKind::Moved,
+                column: 42,
+                row: 0,
+                modifiers: 0,
+            }]
+        );
+    }
+
+    #[test]
     fn vti_escape_arrow_sequence_becomes_arrow_key() {
         let records = "\x1b[A".chars().map(key_char);
         assert_eq!(
@@ -2186,6 +4073,91 @@ mod tests {
                 source: crate::protocol::ClientKeySource::Synthesized,
             }]
         );
+    }
+
+    #[test]
+    fn vti_mouse_recovery_survives_idle_and_split_continuations() {
+        let mut translator = WindowsInputTranslator::default();
+        for record in "\x1b[<3".chars().map(key_char) {
+            assert!(translator.translate(record).is_empty());
+        }
+        assert!(translator.idle().is_empty());
+        assert!(translator.idle().is_empty());
+        for record in "5;28;31M".chars().map(key_char) {
+            assert!(translator.translate(record).is_empty());
+            assert!(translator.idle().is_empty());
+        }
+        assert_eq!(
+            translator.translate(key_char('x')),
+            translate_with_provenance([key_char('x')])
+        );
+    }
+
+    #[test]
+    fn vti_ignored_modifier_record_preserves_mouse_recovery() {
+        for buffered in [false, true] {
+            let mut translator = WindowsInputTranslator::default();
+            for record in "\x1b[<3".chars().map(key_char) {
+                assert!(translator.translate(record).is_empty());
+            }
+            assert!(translator.idle().is_empty());
+            if buffered {
+                assert!(translator.translate(key_char('5')).is_empty());
+            }
+            // A modifier-only Win32 input record emits no semantic input.
+            for record in "\x1b[17;0;0;1;8;3_".chars().map(key_char) {
+                assert!(translator.translate(record).is_empty());
+            }
+            let tail = if buffered { ";28;31M" } else { "5;28;31M" };
+            for record in tail.chars().map(key_char) {
+                assert!(translator.translate(record).is_empty());
+            }
+            assert_eq!(
+                translator.translate(key_char('x')),
+                translate_with_provenance([key_char('x')])
+            );
+        }
+    }
+
+    #[test]
+    fn vti_semantic_input_cancels_mouse_recovery_and_preserves_order() {
+        // These hit Semantic, PasteAwareKey, and physical-Escape forwarding.
+        for interruption in [
+            WindowsInputRecord::Focus(true),
+            key_vk_with_unicode(0x41, 'a', 0),
+            key_vk_with_scan_unicode(0x1b, 1, '\x1b', 0),
+        ] {
+            for buffered in [false, true] {
+                let mut translator = WindowsInputTranslator::default();
+                for record in "\x1b[<3".chars().map(key_char) {
+                    assert!(translator.translate(record).is_empty());
+                }
+                assert!(translator.idle().is_empty());
+                if buffered {
+                    assert!(translator.translate(key_char('5')).is_empty());
+                }
+                let mut events = translator.translate(interruption);
+                events.extend(translator.idle());
+                let mut expected = if buffered {
+                    translate_with_provenance([key_char('5')])
+                } else {
+                    Vec::new()
+                };
+                let mut baseline = WindowsInputTranslator::default();
+                expected.extend(baseline.translate(interruption));
+                expected.extend(baseline.idle());
+                assert_eq!(events, expected);
+
+                let mut later = Vec::new();
+                for record in "5;28;31M".chars().map(key_char) {
+                    later.extend(translator.translate(record));
+                }
+                assert_eq!(
+                    later,
+                    translate_with_provenance("5;28;31M".chars().map(key_char))
+                );
+            }
+        }
     }
 
     #[test]

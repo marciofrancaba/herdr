@@ -1,6 +1,8 @@
 //! Integration tests for headless server mode.
 
-mod support;
+#![cfg(unix)]
+
+pub mod support;
 
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -13,7 +15,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use support::{
-    cleanup_test_base, register_runtime_dir, register_spawned_herdr_pid,
+    cleanup_test_base, client_handshake, register_runtime_dir, register_spawned_herdr_pid,
     unregister_spawned_herdr_pid, CURRENT_PROTOCOL,
 };
 
@@ -42,7 +44,7 @@ impl SpawnedHerdr {
 impl Drop for SpawnedHerdr {
     fn drop(&mut self) {
         let pid = self.child.process_id();
-        let _ = self.child.kill();
+        support::stop_spawned_herdr(&mut *self.child);
         self.close_master();
 
         if let Some(pid) = pid {
@@ -121,6 +123,7 @@ fn spawn_server(
         .unwrap();
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    support::isolate_herdr_test_process(&mut cmd);
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
@@ -149,207 +152,6 @@ fn ping_socket(socket_path: &Path) -> String {
     let mut response = String::new();
     reader.read_line(&mut response).unwrap();
     response.trim().to_string()
-}
-
-/// Sends a Hello message over the client socket and reads the Welcome response.
-/// Uses bincode v2 wire format: [u32LE length][bincode payload]
-/// bincode v2 standard config uses VarintEncoding:
-///   - Integers < 251 are encoded as a single byte
-///   - Enum variant index is encoded as u32 varint
-///   - Option discriminant is always a single byte (0=None, 1=Some)
-///   - String: length (varint) + UTF-8 bytes
-fn client_handshake(
-    stream: &mut UnixStream,
-    version: u32,
-    cols: u16,
-    rows: u16,
-) -> Result<(u32, Option<String>), String> {
-    stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
-        .map_err(|e| e.to_string())?;
-
-    // Encode Hello message using bincode v2 varint format.
-    // ClientMessage::Hello is variant 0.
-    let hello_payload = encode_varint_enum(
-        0,
-        &[
-            &encode_varint_u32(version),
-            &encode_varint_u16(cols),
-            &encode_varint_u16(rows),
-            &encode_varint_u32(8),  // cell_width_px
-            &encode_varint_u32(16), // cell_height_px
-            &encode_varint_u32(0),  // RenderEncoding::SemanticFrame
-            &encode_varint_u32(0),  // ClientKeybindings::Server
-            &encode_varint_u32(0),  // ClientLaunchMode::App
-        ],
-    );
-    let framed = frame_message(&hello_payload);
-    stream.write_all(&framed).map_err(|e| e.to_string())?;
-    stream.flush().map_err(|e| e.to_string())?;
-
-    // Read the framed response.
-    let mut len_buf = [0u8; 4];
-    stream.read_exact(&mut len_buf).map_err(|e| e.to_string())?;
-    let len = u32::from_le_bytes(len_buf) as usize;
-
-    if len > 2 * 1024 * 1024 {
-        return Err(format!("oversized response: {len}"));
-    }
-
-    let mut payload = vec![0u8; len];
-    stream.read_exact(&mut payload).map_err(|e| e.to_string())?;
-
-    // Decode Welcome: ServerMessage variant 0 = Welcome { version: u32, error: Option<String> }
-    decode_welcome(&payload)
-}
-
-/// Encode a varint u32 value according to bincode v2 VarintEncoding.
-fn encode_varint_u32(v: u32) -> Vec<u8> {
-    if v < 251 {
-        vec![v as u8]
-    } else if v < 65536 {
-        let mut buf = vec![251u8];
-        buf.extend_from_slice(&(v as u16).to_le_bytes());
-        buf
-    } else {
-        let mut buf = vec![252u8];
-        buf.extend_from_slice(&v.to_le_bytes());
-        buf
-    }
-}
-
-/// Encode a varint u16 value.
-fn encode_varint_u16(v: u16) -> Vec<u8> {
-    if v < 251 {
-        vec![v as u8]
-    } else {
-        let mut buf = vec![251u8];
-        buf.extend_from_slice(&v.to_le_bytes());
-        buf
-    }
-}
-
-/// Encode an enum variant with its fields.
-fn encode_varint_enum(variant_idx: u32, fields: &[&[u8]]) -> Vec<u8> {
-    let mut buf = encode_varint_u32(variant_idx);
-    for field in fields {
-        buf.extend_from_slice(field);
-    }
-    buf
-}
-
-/// Frame a message with u32LE length prefix.
-fn frame_message(payload: &[u8]) -> Vec<u8> {
-    let len = payload.len() as u32;
-    let mut framed = len.to_le_bytes().to_vec();
-    framed.extend_from_slice(payload);
-    framed
-}
-
-/// Decode a varint u32 from a byte slice at the given offset.
-/// Returns (value, bytes_consumed).
-fn decode_varint_u32(payload: &[u8], offset: usize) -> Result<(u32, usize), String> {
-    if offset >= payload.len() {
-        return Err("payload too short for varint".into());
-    }
-    let first_byte = payload[offset];
-    match first_byte {
-        0..=250 => Ok((first_byte as u32, 1)),
-        251 => {
-            if offset + 3 > payload.len() {
-                return Err("payload too short for u16 varint".into());
-            }
-            let v = u16::from_le_bytes(
-                payload[offset + 1..offset + 3]
-                    .try_into()
-                    .map_err(|e: std::array::TryFromSliceError| e.to_string())?,
-            );
-            Ok((v as u32, 3))
-        }
-        252 => {
-            if offset + 5 > payload.len() {
-                return Err("payload too short for u32 varint".into());
-            }
-            let v = u32::from_le_bytes(
-                payload[offset + 1..offset + 5]
-                    .try_into()
-                    .map_err(|e: std::array::TryFromSliceError| e.to_string())?,
-            );
-            Ok((v, 5))
-        }
-        _ => Err(format!("unsupported varint tag: {first_byte}")),
-    }
-}
-
-/// Decode a varint u16 from a byte slice at the given offset.
-#[allow(dead_code)]
-fn decode_varint_u16(payload: &[u8], offset: usize) -> Result<(u16, usize), String> {
-    if offset >= payload.len() {
-        return Err("payload too short for varint".into());
-    }
-    let first_byte = payload[offset];
-    match first_byte {
-        0..=250 => Ok((first_byte as u16, 1)),
-        251 => {
-            if offset + 3 > payload.len() {
-                return Err("payload too short for u16 varint".into());
-            }
-            let v = u16::from_le_bytes(
-                payload[offset + 1..offset + 3]
-                    .try_into()
-                    .map_err(|e: std::array::TryFromSliceError| e.to_string())?,
-            );
-            Ok((v, 3))
-        }
-        _ => Err(format!("unsupported varint tag for u16: {first_byte}")),
-    }
-}
-
-/// Decode a ServerMessage::Welcome from bincode v2 payload.
-fn decode_welcome(payload: &[u8]) -> Result<(u32, Option<String>), String> {
-    let mut offset = 0;
-
-    // Variant index (should be 0 for Welcome)
-    let (variant, consumed) = decode_varint_u32(payload, offset)?;
-    offset += consumed;
-    if variant != 0 {
-        return Err(format!(
-            "expected Welcome (variant 0), got variant {variant}"
-        ));
-    }
-
-    // version: u32
-    let (version, consumed) = decode_varint_u32(payload, offset)?;
-    offset += consumed;
-
-    // encoding: RenderEncoding
-    let (_encoding, consumed) = decode_varint_u32(payload, offset)?;
-    offset += consumed;
-
-    // error: Option<String> — discriminant is always 1 byte
-    if offset >= payload.len() {
-        return Err("payload too short for Option tag".into());
-    }
-    let option_tag = payload[offset];
-    offset += 1;
-
-    let error = if option_tag == 1 {
-        // Some(String) — length as varint + UTF-8 bytes
-        let (str_len, consumed) = decode_varint_u32(payload, offset)?;
-        offset += consumed;
-        let str_len = str_len as usize;
-
-        if offset + str_len > payload.len() {
-            return Err("payload too short for string content".into());
-        }
-        let s = String::from_utf8(payload[offset..offset + str_len].to_vec())
-            .map_err(|e| e.to_string())?;
-        Some(s)
-    } else {
-        None
-    };
-
-    Ok((version, error))
 }
 
 // ---------------------------------------------------------------------------
@@ -447,8 +249,8 @@ fn server_removes_client_socket_on_exit() {
     wait_for_socket(&api_socket, Duration::from_secs(10));
     wait_for_file(&client_socket, Duration::from_secs(10));
 
-    // Kill the server.
-    let _ = spawned.child.kill();
+    // Stop the server.
+    support::stop_spawned_herdr(&mut *spawned.child);
     spawned.close_master();
     let _ = spawned.child.wait();
 
@@ -555,6 +357,7 @@ fn duplicate_server_start_fails_gracefully() {
         .unwrap();
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    support::isolate_herdr_test_process(&mut cmd);
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", &config_home);
     cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
@@ -731,6 +534,117 @@ fn no_hello_client_closed_within_five_seconds() {
         response.contains("pong"),
         "server should still respond to ping: {response}"
     );
+
+    cleanup_spawned_herdr(spawned, base);
+}
+
+fn server_log_path(config_home: &Path) -> PathBuf {
+    let app_dir_name = if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    };
+    config_home.join(app_dir_name).join("herdr-server.log")
+}
+
+fn wait_for_exit(child: &mut Box<dyn Child + Send + Sync>, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if child.try_wait().ok().flatten().is_some() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    false
+}
+
+fn wait_for_log_line(path: &Path, needle: &str, timeout: Duration) -> String {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let content = fs::read_to_string(path).unwrap_or_default();
+        if let Some(line) = content.lines().find(|line| line.contains(needle)) {
+            return line.to_string();
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    panic!(
+        "log {} did not contain {needle:?}:\n{}",
+        path.display(),
+        fs::read_to_string(path).unwrap_or_default()
+    );
+}
+
+#[test]
+fn server_survives_hangup_and_logs_why_it_stops() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    let pid = spawned.child.process_id().expect("server pid") as libc::pid_t;
+
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGHUP) }, 0);
+    // Closing the terminal hangs up the server's whole session too.
+    spawned.close_master();
+    assert!(
+        !wait_for_exit(&mut spawned.child, Duration::from_millis(500)),
+        "server must not stop on SIGHUP"
+    );
+    assert!(ping_socket(&api_socket).contains("pong"));
+
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGTERM) }, 0);
+    assert!(
+        wait_for_exit(&mut spawned.child, Duration::from_secs(10)),
+        "server must stop on SIGTERM"
+    );
+    let line = wait_for_log_line(
+        &server_log_path(&config_home),
+        "server shutdown initiated",
+        Duration::from_secs(5),
+    );
+    assert!(line.contains("reason=SIGTERM"), "{line}");
+
+    cleanup_spawned_herdr(spawned, base);
+}
+
+#[test]
+fn server_stop_request_logs_its_caller() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let client_socket = runtime_dir.join("herdr-client.sock");
+
+    let mut spawned = spawn_server(&config_home, &runtime_dir, &api_socket, &client_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+
+    let mut stream = UnixStream::connect(&api_socket).unwrap();
+    writeln!(
+        stream,
+        r#"{{"id":"stop","method":"server.stop","params":{{}}}}"#
+    )
+    .unwrap();
+    let mut response = String::new();
+    BufReader::new(stream).read_line(&mut response).unwrap();
+    assert!(response.contains("\"ok\""), "{response}");
+
+    assert!(wait_for_exit(&mut spawned.child, Duration::from_secs(10)));
+    let line = wait_for_log_line(
+        &server_log_path(&config_home),
+        "server shutdown initiated",
+        Duration::from_secs(5),
+    );
+    let expected = if cfg!(any(target_os = "linux", target_os = "macos")) {
+        format!("server.stop request from pid {}", std::process::id())
+    } else {
+        "server.stop request".to_string()
+    };
+    assert!(line.contains(&expected), "{line}");
 
     cleanup_spawned_herdr(spawned, base);
 }

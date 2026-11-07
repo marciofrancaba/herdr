@@ -12,11 +12,11 @@ impl App {
             .find_map(|(ws_idx, ws)| ws.pane_state(pane_id).map(|pane| (ws_idx, pane)))
     }
 
-    pub(super) fn public_workspace_id(&self, ws_idx: usize) -> String {
+    pub(crate) fn public_workspace_id(&self, ws_idx: usize) -> String {
         self.state.workspaces[ws_idx].id.clone()
     }
 
-    pub(super) fn public_tab_id(&self, ws_idx: usize, tab_idx: usize) -> Option<String> {
+    pub(crate) fn public_tab_id(&self, ws_idx: usize, tab_idx: usize) -> Option<String> {
         let ws = self.state.workspaces.get(ws_idx)?;
         let tab_number = ws.public_tab_number(tab_idx)?;
         Some(crate::workspace::public_tab_id_for_number(
@@ -24,7 +24,7 @@ impl App {
         ))
     }
 
-    pub(super) fn public_pane_id(
+    pub(crate) fn public_pane_id(
         &self,
         ws_idx: usize,
         pane_id: crate::layout::PaneId,
@@ -57,16 +57,17 @@ impl App {
         )
     }
 
-    pub(super) fn parse_workspace_id(&self, id: &str) -> Option<usize> {
+    pub(crate) fn parse_workspace_id(&self, id: &str) -> Option<usize> {
         self.state
             .workspaces
             .iter()
             .position(|workspace| workspace.id == id)
             .or_else(|| id.strip_prefix("w_")?.parse::<usize>().ok()?.checked_sub(1))
             .or_else(|| id.parse::<usize>().ok()?.checked_sub(1))
+            .filter(|&index| index < self.state.workspaces.len())
     }
 
-    pub(super) fn parse_tab_id(&self, id: &str) -> Option<(usize, usize)> {
+    pub(crate) fn parse_tab_id(&self, id: &str) -> Option<(usize, usize)> {
         if let Some(rest) = id.strip_prefix("t_") {
             let (ws_raw, tab_raw) = rest.rsplit_once('_')?;
             let ws_idx = self.parse_workspace_id(ws_raw)?;
@@ -103,7 +104,7 @@ impl App {
         None
     }
 
-    pub(super) fn parse_pane_id(&self, id: &str) -> Option<(usize, crate::layout::PaneId)> {
+    pub(crate) fn parse_pane_id(&self, id: &str) -> Option<(usize, crate::layout::PaneId)> {
         if let Some(alias) = self.state.public_pane_id_aliases.get(id).copied() {
             return self.find_pane(alias).map(|(ws_idx, _)| (ws_idx, alias));
         }
@@ -148,5 +149,33 @@ impl App {
     ) -> Option<(usize, crate::layout::PaneId)> {
         let (ws_idx, pane_id) = self.parse_pane_id(id)?;
         (self.public_pane_id(ws_idx, pane_id).as_deref() == Some(id)).then_some((ws_idx, pane_id))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::App;
+    use crate::{config::Config, workspace::Workspace};
+
+    #[test]
+    fn numeric_workspace_ids_beyond_the_last_workspace_are_not_found() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("only")];
+        let id = app.state.workspaces[0].id.clone();
+
+        assert_eq!(app.parse_workspace_id(&id), Some(0));
+        assert_eq!(app.parse_workspace_id("1"), Some(0));
+        assert_eq!(app.parse_workspace_id("w_1"), Some(0));
+        for id in ["2", "999", "w_2", "w_999", "0", "w_0"] {
+            assert_eq!(app.parse_workspace_id(id), None, "{id}");
+        }
+        assert_eq!(app.parse_tab_id("2:1"), None);
     }
 }

@@ -1,4 +1,6 @@
-mod support;
+#![cfg(unix)]
+
+pub mod support;
 
 use std::fs;
 use std::io::{Read, Write};
@@ -30,7 +32,7 @@ struct SpawnedHerdr {
 impl Drop for SpawnedHerdr {
     fn drop(&mut self) {
         let pid = self.child.process_id();
-        let _ = self.child.kill();
+        support::stop_spawned_herdr(&mut *self.child);
 
         if let Some(pid) = pid {
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -139,6 +141,7 @@ fn spawn_herdr_with_options(
         .unwrap();
 
     let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_herdr"));
+    support::isolate_herdr_test_process(&mut cmd);
     cmd.arg("server");
     cmd.env("XDG_CONFIG_HOME", config_home);
     cmd.env("XDG_RUNTIME_DIR", runtime_dir);
@@ -304,7 +307,48 @@ fn ping_over_socket_returns_version() {
     assert_eq!(value["result"]["version"], env!("CARGO_PKG_VERSION"));
     // Intentionally hardcoded so wire protocol bumps require updating this test.
     // Changing this value means old clients/servers are no longer compatible.
-    assert_eq!(value["result"]["protocol"], 19);
+    assert_eq!(value["result"]["protocol"], 22);
+
+    cleanup_spawned_herdr(child, base);
+}
+
+#[test]
+fn spawned_server_ignores_inherited_pane_env() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+    let startup_cwd = base.join("startup");
+    fs::create_dir_all(&startup_cwd).unwrap();
+
+    // A shell inside a herdr pane passes these to every process it starts.
+    let saved: Vec<_> = ["HERDR_STARTUP_CWD", "HERDR_SESSION"]
+        .into_iter()
+        .map(|name| (name, std::env::var_os(name)))
+        .collect();
+    std::env::set_var("HERDR_STARTUP_CWD", &startup_cwd);
+    std::env::set_var("HERDR_SESSION", "inherited");
+    let child = spawn_herdr(&config_home, &runtime_dir, &socket_path);
+    for (name, value) in saved {
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+    }
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let value = send_request(
+        &socket_path,
+        r#"{"id":"req_1","method":"workspace.list","params":{}}"#,
+    );
+    assert_eq!(value["result"]["workspaces"], serde_json::json!([]));
+    let app_dir = if cfg!(debug_assertions) {
+        "herdr-dev"
+    } else {
+        "herdr"
+    };
+    assert!(!config_home.join(app_dir).join("sessions").exists());
 
     cleanup_spawned_herdr(child, base);
 }
@@ -350,6 +394,78 @@ contains = ["server-reload-marker"]
     assert_eq!(codex["source_kind"], "local override");
     assert_eq!(codex["source"], override_path.display().to_string());
     assert!(codex.get("warning").is_none());
+
+    cleanup_spawned_herdr(child, base);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn shutdown_preserves_session_after_shell_is_signaled() {
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let socket_path = runtime_dir.join("herdr.sock");
+
+    let mut child = spawn_herdr_with_shell(&config_home, &runtime_dir, &socket_path, "/bin/sh");
+    wait_for_socket(&socket_path, Duration::from_secs(5));
+
+    let created = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"create","method":"workspace.create","params":{{"cwd":"{}","focus":true}}}}"#,
+            base.display()
+        ),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .expect("root pane id");
+    let process_info = send_request(
+        &socket_path,
+        &format!(
+            r#"{{"id":"process","method":"pane.process_info","params":{{"pane_id":"{pane_id}"}}}}"#
+        ),
+    );
+    let shell_pid = process_info["result"]["process_info"]["shell_pid"]
+        .as_u64()
+        .expect("shell pid") as libc::pid_t;
+
+    assert_eq!(unsafe { libc::kill(shell_pid, libc::SIGHUP) }, 0);
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let panes = send_request(
+            &socket_path,
+            r#"{"id":"panes","method":"pane.list","params":{}}"#,
+        );
+        if panes["result"]["panes"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "signaled pane was not removed");
+        thread::sleep(Duration::from_millis(20));
+    }
+
+    let stopped = send_request(
+        &socket_path,
+        r#"{"id":"stop","method":"server.stop","params":{}}"#,
+    );
+    assert_eq!(stopped["result"]["type"], "ok");
+    child.child.wait().expect("server should stop cleanly");
+
+    let session: serde_json::Value = serde_json::from_slice(
+        &fs::read(config_home.join("herdr-dev/session.json")).expect("saved session"),
+    )
+    .expect("valid session json");
+    assert_eq!(session["workspaces"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        session["workspaces"][0]["tabs"][0]["panes"]
+            .as_object()
+            .map(serde_json::Map::len),
+        Some(1)
+    );
 
     cleanup_spawned_herdr(child, base);
 }
@@ -502,7 +618,7 @@ fn workspace_list_and_create_round_trip() {
     let recent = send_request(
         &socket_path,
         &format!(
-            r#"{{"id":"req_11","method":"pane.read","params":{{"pane_id":"{}","source":"recent","lines":20}}}}"#,
+            r#"{{"id":"req_11","method":"pane.read","params":{{"pane_id":"{}","source":"recent","lines":50}}}}"#,
             pane_id
         ),
     );
@@ -969,9 +1085,11 @@ fn new_terminal_cwd_follow_ignores_nonleader_group_member_cwd() {
         ),
     );
     assert_eq!(pane["result"]["pane"]["cwd"], base.display().to_string());
+    // Regression for issue #3270: the foreground group leader's cwd is
+    // authoritative; the backgrounded helper's chdir must not override it.
     assert_eq!(
         pane["result"]["pane"]["foreground_cwd"],
-        helper_cwd.display().to_string()
+        base.display().to_string()
     );
 
     let split = send_request(
@@ -1494,6 +1612,12 @@ fn events_subscribe_streams_pane_split_and_close_events() {
     let ack = reader.read_json_line(Duration::from_secs(2));
     assert_eq!(ack["id"], "sub_life_b");
     assert_eq!(ack["result"]["type"], "subscription_started");
+    assert!(
+        reader
+            .try_read_json_line(Duration::from_millis(250))
+            .is_none(),
+        "new subscription must not replay the root pane creation"
+    );
 
     let split = send_request(
         &socket_path,

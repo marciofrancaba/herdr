@@ -1,9 +1,10 @@
 use regex::Regex;
 
+use crate::api::event_hub::EventHistoryError;
 use crate::api::schema::{
-    ErrorBody, ErrorResponse, Method, PaneAgentStatusChangedEvent, PaneOutputMatchedEvent,
-    PaneScrollChangedEvent, PaneScrollInfo, Request, Subscription, SubscriptionEventData,
-    SubscriptionEventEnvelope, SubscriptionEventKind,
+    ErrorBody, ErrorResponse, EventKind, Method, PaneAgentStatusChangedEvent,
+    PaneOutputMatchedEvent, PaneScrollChangedEvent, PaneScrollInfo, Request, Subscription,
+    SubscriptionEventData, SubscriptionEventEnvelope, SubscriptionEventKind,
 };
 use crate::api::server::{dispatch_to_app_with_timeout, APP_RESPONSE_TIMEOUT};
 use crate::api::{ApiRequestSender, EventHub};
@@ -110,104 +111,54 @@ impl ActiveSubscription {
         index: usize,
         api_tx: &ApiRequestSender,
         event_hub: &EventHub,
+        event_start_sequence: u64,
     ) -> Result<Self, ErrorResponse> {
+        let event_subscription = |event_kind| {
+            Self::Event(ActiveEventSubscription {
+                event_kind,
+                last_sequence: event_start_sequence,
+            })
+        };
+
         match subscription {
-            Subscription::WorkspaceCreated {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::WorkspaceCreated,
-                last_sequence: 0,
-            })),
-            Subscription::WorkspaceUpdated {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::WorkspaceUpdated,
-                last_sequence: 0,
-            })),
-            Subscription::WorkspaceMetadataUpdated {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::WorkspaceMetadataUpdated,
-                last_sequence: 0,
-            })),
-            Subscription::WorkspaceRenamed {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::WorkspaceRenamed,
-                last_sequence: 0,
-            })),
-            Subscription::WorkspaceMoved {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::WorkspaceMoved,
-                last_sequence: 0,
-            })),
-            Subscription::WorkspaceReordered {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::WorkspaceReordered,
-                last_sequence: 0,
-            })),
-            Subscription::WorkspaceClosed {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::WorkspaceClosed,
-                last_sequence: 0,
-            })),
-            Subscription::WorkspaceFocused {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::WorkspaceFocused,
-                last_sequence: 0,
-            })),
-            Subscription::WorktreeCreated {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::WorktreeCreated,
-                last_sequence: 0,
-            })),
-            Subscription::WorktreeOpened {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::WorktreeOpened,
-                last_sequence: 0,
-            })),
-            Subscription::WorktreeRemoved {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::WorktreeRemoved,
-                last_sequence: 0,
-            })),
-            Subscription::TabCreated {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::TabCreated,
-                last_sequence: 0,
-            })),
-            Subscription::TabClosed {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::TabClosed,
-                last_sequence: 0,
-            })),
-            Subscription::TabFocused {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::TabFocused,
-                last_sequence: 0,
-            })),
-            Subscription::TabRenamed {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::TabRenamed,
-                last_sequence: 0,
-            })),
-            Subscription::TabMoved {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::TabMoved,
-                last_sequence: 0,
-            })),
-            Subscription::PaneCreated {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::PaneCreated,
-                last_sequence: 0,
-            })),
-            Subscription::PaneClosed {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::PaneClosed,
-                last_sequence: 0,
-            })),
-            Subscription::PaneUpdated {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::PaneUpdated,
-                last_sequence: 0,
-            })),
-            Subscription::PaneFocused {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::PaneFocused,
-                last_sequence: 0,
-            })),
-            Subscription::PaneMoved {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::PaneMoved,
-                last_sequence: 0,
-            })),
-            Subscription::PaneExited {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::PaneExited,
-                last_sequence: 0,
-            })),
-            Subscription::PaneAgentDetected {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::PaneAgentDetected,
-                last_sequence: 0,
-            })),
-            Subscription::LayoutUpdated {} => Ok(Self::Event(ActiveEventSubscription {
-                event_kind: crate::api::schema::EventKind::LayoutUpdated,
-                last_sequence: 0,
-            })),
+            Subscription::WorkspaceCreated {} => {
+                Ok(event_subscription(EventKind::WorkspaceCreated))
+            }
+            Subscription::WorkspaceUpdated {} => {
+                Ok(event_subscription(EventKind::WorkspaceUpdated))
+            }
+            Subscription::WorkspaceMetadataUpdated {} => {
+                Ok(event_subscription(EventKind::WorkspaceMetadataUpdated))
+            }
+            Subscription::WorkspaceRenamed {} => {
+                Ok(event_subscription(EventKind::WorkspaceRenamed))
+            }
+            Subscription::WorkspaceMoved {} => Ok(event_subscription(EventKind::WorkspaceMoved)),
+            Subscription::WorkspaceReordered {} => {
+                Ok(event_subscription(EventKind::WorkspaceReordered))
+            }
+            Subscription::WorkspaceClosed {} => Ok(event_subscription(EventKind::WorkspaceClosed)),
+            Subscription::WorkspaceFocused {} => {
+                Ok(event_subscription(EventKind::WorkspaceFocused))
+            }
+            Subscription::WorktreeCreated {} => Ok(event_subscription(EventKind::WorktreeCreated)),
+            Subscription::WorktreeOpened {} => Ok(event_subscription(EventKind::WorktreeOpened)),
+            Subscription::WorktreeRemoved {} => Ok(event_subscription(EventKind::WorktreeRemoved)),
+            Subscription::TabCreated {} => Ok(event_subscription(EventKind::TabCreated)),
+            Subscription::TabClosed {} => Ok(event_subscription(EventKind::TabClosed)),
+            Subscription::TabFocused {} => Ok(event_subscription(EventKind::TabFocused)),
+            Subscription::TabRenamed {} => Ok(event_subscription(EventKind::TabRenamed)),
+            Subscription::TabMoved {} => Ok(event_subscription(EventKind::TabMoved)),
+            Subscription::PaneCreated {} => Ok(event_subscription(EventKind::PaneCreated)),
+            Subscription::PaneClosed {} => Ok(event_subscription(EventKind::PaneClosed)),
+            Subscription::PaneUpdated {} => Ok(event_subscription(EventKind::PaneUpdated)),
+            Subscription::PaneFocused {} => Ok(event_subscription(EventKind::PaneFocused)),
+            Subscription::PaneMoved {} => Ok(event_subscription(EventKind::PaneMoved)),
+            Subscription::PaneExited {} => Ok(event_subscription(EventKind::PaneExited)),
+            Subscription::PaneAgentDetected {} => {
+                Ok(event_subscription(EventKind::PaneAgentDetected))
+            }
+            Subscription::LayoutUpdated {} => Ok(event_subscription(EventKind::LayoutUpdated)),
             Subscription::PaneOutputMatched {
                 pane_id,
                 source,
@@ -327,6 +278,72 @@ impl ActiveSubscription {
             _ => Ok(self.poll(api_tx, event_hub)),
         }
     }
+
+    pub(super) fn poll_batch(
+        &mut self,
+        api_tx: &ApiRequestSender,
+        event_hub: &EventHub,
+    ) -> Result<Vec<serde_json::Value>, ErrorBody> {
+        match self {
+            Self::Event(subscription) => {
+                let events = subscription_events_after(event_hub, subscription.last_sequence)?;
+                let mut matching = Vec::new();
+                for (sequence, event) in events {
+                    subscription.last_sequence = sequence;
+                    if event.event == subscription.event_kind {
+                        matching.push(serde_json::to_value(event).map_err(event_encoding_error)?);
+                    }
+                }
+                Ok(matching)
+            }
+            Self::AgentStatusChanged(subscription) => {
+                let events = subscription_events_after(event_hub, subscription.last_sequence)?;
+                let mut matching = Vec::new();
+                for (sequence, event) in events {
+                    subscription.last_sequence = sequence;
+                    if let Some(event) = subscription.event_from_history(event) {
+                        matching.push(serde_json::to_value(event).map_err(event_encoding_error)?);
+                    }
+                }
+                if matching.is_empty() {
+                    if let Some(event) =
+                        subscription.poll_snapshot(api_tx, event_hub).ok().flatten()
+                    {
+                        matching.push(serde_json::to_value(event).map_err(event_encoding_error)?);
+                    }
+                }
+                Ok(matching)
+            }
+            // These subscriptions sample current state, not retained event history.
+            // Keep their existing cadence even when a lifecycle batch was nonempty.
+            Self::OutputMatched(_) | Self::ScrollChanged(_) => {
+                Ok(self.poll(api_tx, event_hub).into_iter().collect())
+            }
+        }
+    }
+}
+
+fn subscription_events_after(
+    event_hub: &EventHub,
+    sequence: u64,
+) -> Result<Vec<(u64, crate::api::schema::EventEnvelope)>, ErrorBody> {
+    event_hub.events_after_checked(sequence).map_err(|error| match error {
+        EventHistoryError::Lost => ErrorBody {
+            code: "events_lost".into(),
+            message: "event subscription fell behind retained history; resubscribe and resync with session.snapshot".into(),
+        },
+        EventHistoryError::Unavailable => ErrorBody {
+            code: "server_unavailable".into(),
+            message: "event history is unavailable".into(),
+        },
+    })
+}
+
+fn event_encoding_error(error: serde_json::Error) -> ErrorBody {
+    ErrorBody {
+        code: "internal_error".into(),
+        message: format!("failed to encode subscription event: {error}"),
+    }
 }
 
 impl ActiveEventSubscription {
@@ -391,10 +408,55 @@ impl ActiveAgentStatusChangedSubscription {
         api_tx: &ApiRequestSender,
         event_hub: &EventHub,
     ) -> Result<Option<SubscriptionEventEnvelope>, ErrorResponse> {
-        let mut saw_status_event = false;
         for (sequence, event) in event_hub.events_after(self.last_sequence) {
             self.last_sequence = sequence;
-            let crate::api::schema::EventData::PaneAgentStatusChanged {
+            if let Some(event) = self.event_from_history(event) {
+                return Ok(Some(event));
+            }
+        }
+
+        self.poll_snapshot(api_tx, event_hub)
+    }
+
+    fn event_from_history(
+        &mut self,
+        event: crate::api::schema::EventEnvelope,
+    ) -> Option<SubscriptionEventEnvelope> {
+        if event.event != EventKind::PaneAgentStatusChanged {
+            return None;
+        }
+        let crate::api::schema::EventData::PaneAgentStatusChanged {
+            pane_id,
+            workspace_id,
+            agent_status,
+            agent,
+            title,
+            display_agent,
+            state_labels,
+        } = event.data
+        else {
+            return None;
+        };
+        if pane_id != self.pane_id {
+            return None;
+        }
+        self.last_status = Some(agent_status);
+        self.last_presentation = Some(PanePresentationSnapshot::from_event(
+            &title,
+            &display_agent,
+            &state_labels,
+        ));
+        self.initial_event = None;
+        if self
+            .status_filter
+            .is_some_and(|wanted| wanted != agent_status)
+        {
+            return None;
+        }
+
+        Some(SubscriptionEventEnvelope {
+            event: SubscriptionEventKind::PaneAgentStatusChanged,
+            data: SubscriptionEventData::PaneAgentStatusChanged(PaneAgentStatusChangedEvent {
                 pane_id,
                 workspace_id,
                 agent_status,
@@ -402,47 +464,16 @@ impl ActiveAgentStatusChangedSubscription {
                 title,
                 display_agent,
                 state_labels,
-            } = event.data
-            else {
-                continue;
-            };
-            if event.event != crate::api::schema::EventKind::PaneAgentStatusChanged {
-                continue;
-            }
-            if pane_id != self.pane_id {
-                continue;
-            }
-            saw_status_event = true;
+            }),
+        })
+    }
 
-            let current_presentation =
-                PanePresentationSnapshot::from_event(&title, &display_agent, &state_labels);
-            self.last_status = Some(agent_status);
-            self.last_presentation = Some(current_presentation);
-            if self
-                .status_filter
-                .is_some_and(|wanted| wanted != agent_status)
-            {
-                continue;
-            }
-
-            self.initial_event = None;
-            return Ok(Some(SubscriptionEventEnvelope {
-                event: SubscriptionEventKind::PaneAgentStatusChanged,
-                data: SubscriptionEventData::PaneAgentStatusChanged(PaneAgentStatusChangedEvent {
-                    pane_id,
-                    workspace_id,
-                    agent_status,
-                    agent,
-                    title,
-                    display_agent,
-                    state_labels,
-                }),
-            }));
-        }
-
-        if saw_status_event {
-            self.initial_event = None;
-        } else if event_hub.current_sequence() != self.last_sequence {
+    fn poll_snapshot(
+        &mut self,
+        api_tx: &ApiRequestSender,
+        event_hub: &EventHub,
+    ) -> Result<Option<SubscriptionEventEnvelope>, ErrorResponse> {
+        if event_hub.current_sequence() != self.last_sequence {
             return Ok(None);
         } else if let Some(event) = self.initial_event.take() {
             return Ok(Some(SubscriptionEventEnvelope {
@@ -652,6 +683,15 @@ mod tests {
         }
     }
 
+    fn workspace_focused_event(workspace_id: &str) -> EventEnvelope {
+        EventEnvelope {
+            event: EventKind::WorkspaceFocused,
+            data: EventData::WorkspaceFocused {
+                workspace_id: workspace_id.into(),
+            },
+        }
+    }
+
     fn pane_info_with_scroll(scroll: Option<PaneScrollInfo>) -> PaneInfo {
         PaneInfo {
             pane_id: "pane_1".into(),
@@ -661,6 +701,7 @@ mod tests {
             focused: true,
             cwd: None,
             foreground_cwd: None,
+            restore_error: None,
             label: None,
             agent: None,
             title: None,
@@ -677,6 +718,35 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_subscription_skips_history_but_keeps_setup_window_events() {
+        let event_hub = EventHub::default();
+        event_hub.push(workspace_focused_event("before_subscription"));
+        let event_start_sequence = event_hub.current_sequence();
+        event_hub.push(workspace_focused_event("during_setup"));
+
+        let (api_tx, _api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut subscription = ActiveSubscription::new(
+            Subscription::WorkspaceFocused {},
+            "test",
+            0,
+            &api_tx,
+            &event_hub,
+            event_start_sequence,
+        )
+        .expect("workspace focus subscription");
+
+        let setup_event = subscription
+            .poll(&api_tx, &event_hub)
+            .expect("setup-window event");
+        assert_eq!(setup_event["data"]["workspace_id"], "during_setup");
+        assert!(subscription.poll(&api_tx, &event_hub).is_none());
+
+        event_hub.push(workspace_focused_event("after_setup"));
+        let live_event = subscription.poll(&api_tx, &event_hub).expect("live event");
+        assert_eq!(live_event["data"]["workspace_id"], "after_setup");
+    }
+
+    #[test]
     fn workspace_metadata_subscription_uses_dedicated_event_kind() {
         let event_hub = EventHub::default();
         let (api_tx, _api_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -686,6 +756,7 @@ mod tests {
             0,
             &api_tx,
             &event_hub,
+            event_hub.current_sequence(),
         )
         .expect("workspace metadata subscription");
 
@@ -696,6 +767,96 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn lifecycle_batch_drains_in_order_and_advances_past_unmatched_events() {
+        let event_hub = EventHub::default();
+        event_hub.push(workspace_focused_event("old"));
+        let start = event_hub.current_sequence();
+        event_hub.push(workspace_focused_event("setup"));
+        let (api_tx, _api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut subscription = ActiveSubscription::new(
+            Subscription::WorkspaceFocused {},
+            "batch",
+            0,
+            &api_tx,
+            &event_hub,
+            start,
+        )
+        .unwrap();
+        event_hub.push(presentation_event(None));
+        event_hub.push(workspace_focused_event("live"));
+        let events = subscription.poll_batch(&api_tx, &event_hub).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["data"]["workspace_id"], "setup");
+        assert_eq!(events[1]["data"]["workspace_id"], "live");
+        assert!(subscription
+            .poll_batch(&api_tx, &event_hub)
+            .unwrap()
+            .is_empty());
+        let ActiveSubscription::Event(subscription) = subscription else {
+            panic!("expected lifecycle subscription");
+        };
+        assert_eq!(subscription.last_sequence, event_hub.current_sequence());
+    }
+
+    #[test]
+    fn agent_status_batch_preserves_transitions_filters_and_initial_state_ordering() {
+        for filtered in [false, true] {
+            let event_hub = EventHub::default();
+            let mut subscription = ActiveSubscription::AgentStatusChanged(Box::new(
+                ActiveAgentStatusChangedSubscription {
+                    pane_id: "pane_1".into(),
+                    status_filter: filtered.then_some(AgentStatus::Working),
+                    last_status: Some(AgentStatus::Working),
+                    last_presentation: None,
+                    last_sequence: event_hub.current_sequence(),
+                    initial_event: Some(PaneAgentStatusChangedEvent {
+                        pane_id: "pane_1".into(),
+                        workspace_id: "workspace_1".into(),
+                        agent_status: AgentStatus::Working,
+                        agent: Some("pi".into()),
+                        title: Some("stale initial snapshot".into()),
+                        display_agent: None,
+                        state_labels: HashMap::new(),
+                    }),
+                    request_prefix: "batch".into(),
+                },
+            ));
+            for (status, title) in [
+                (AgentStatus::Working, "started"),
+                (AgentStatus::Blocked, "approval"),
+                (AgentStatus::Idle, "finished"),
+                (AgentStatus::Working, "restarted"),
+            ] {
+                let mut event = presentation_event(Some(title));
+                let EventData::PaneAgentStatusChanged { agent_status, .. } = &mut event.data else {
+                    panic!("expected status data");
+                };
+                *agent_status = status;
+                event_hub.push(event);
+            }
+            let (api_tx, _api_rx) = tokio::sync::mpsc::unbounded_channel();
+            let events = subscription.poll_batch(&api_tx, &event_hub).unwrap();
+            let titles = events
+                .iter()
+                .map(|event| event["data"]["title"].as_str().unwrap())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                titles,
+                if filtered {
+                    vec!["started", "restarted"]
+                } else {
+                    vec!["started", "approval", "finished", "restarted"]
+                }
+            );
+            let ActiveSubscription::AgentStatusChanged(subscription) = subscription else {
+                panic!("expected agent subscription");
+            };
+            assert_eq!(subscription.last_sequence, event_hub.current_sequence());
+            assert!(subscription.initial_event.is_none());
+        }
     }
 
     #[test]

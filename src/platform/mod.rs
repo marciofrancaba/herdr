@@ -3,6 +3,86 @@
 //! Centralizes OS-dependent behavior behind a clean boundary so core
 //! modules don't scatter `#[cfg]` branches through product logic.
 
+#[cfg(unix)]
+pub(crate) mod ssh_agent;
+
+pub(crate) struct HostShutdownMonitor {
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl HostShutdownMonitor {
+    pub(crate) fn start(
+        requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        intent: HostShutdownIntentCell,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        let task = monitor_host_shutdown(requested, intent, wake);
+        Self { task }
+    }
+}
+
+impl Drop for HostShutdownMonitor {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+/// A restart or shutdown the host announced but has not committed to yet.
+///
+/// Live handoff carries it so a replacement server still recognizes the
+/// commit point. The value is captured when the old server builds its handoff
+/// manifest; announcements or cancellations that arrive after that and before
+/// the replacement starts its monitor reach only the old server. Each handoff
+/// phase may take up to 30 seconds, so that window can last tens of seconds.
+/// Only macOS reports an intent; the timestamp is in its boot-wide monotonic
+/// clock, which is shared by the old and new server processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HostShutdownIntent {
+    announced_at_ns: u64,
+}
+
+/// The pending host shutdown intent shared by the server and its monitor.
+// Windows has no live handoff and no announcement to record, so nothing reads it there.
+#[cfg_attr(windows, allow(dead_code))]
+#[derive(Debug, Clone, Default)]
+pub(crate) struct HostShutdownIntentCell(
+    std::sync::Arc<std::sync::Mutex<Option<HostShutdownIntent>>>,
+);
+
+// Windows has no live handoff and no announcement to record, so nothing reads it there.
+#[cfg_attr(windows, allow(dead_code))]
+impl HostShutdownIntentCell {
+    pub(crate) fn get(&self) -> Option<HostShutdownIntent> {
+        *self.lock()
+    }
+
+    pub(crate) fn set(&self, intent: Option<HostShutdownIntent>) {
+        *self.lock() = intent;
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<HostShutdownIntent>> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn monitor_host_shutdown(
+    _requested: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    _intent: HostShutdownIntentCell,
+    _wake: impl Fn() + Send + Sync + 'static,
+) -> Option<tokio::task::JoinHandle<()>> {
+    None
+}
+
+#[cfg(not(windows))]
+pub(crate) fn host_shutdown_in_progress() -> bool {
+    false
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForegroundProcess {
     pub pid: u32,
@@ -18,11 +98,89 @@ pub struct ForegroundJob {
     pub processes: Vec<ForegroundProcess>,
 }
 
+/// A request from outside the process to stop the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServerQuitSignal {
+    #[cfg(unix)]
+    Interrupt,
+    #[cfg(unix)]
+    Terminate,
+    #[cfg(not(unix))]
+    ConsoleControl,
+}
+
+impl std::fmt::Display for ServerQuitSignal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            #[cfg(unix)]
+            Self::Interrupt => "SIGINT",
+            #[cfg(unix)]
+            Self::Terminate => "SIGTERM",
+            #[cfg(not(unix))]
+            Self::ConsoleControl => "console control event",
+        })
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn spawn_server_signal_monitor(
+    on_quit: impl Fn(ServerQuitSignal) + Send + Sync + 'static,
+) {
+    if let Err(err) = ctrlc::set_handler(move || on_quit(ServerQuitSignal::ConsoleControl)) {
+        tracing::warn!(%err, "failed to install server stop handler");
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) fn ignore_server_hangup() {}
+
+#[cfg(not(unix))]
+pub(crate) fn local_stream_peer_description(_stream: &crate::ipc::LocalStream) -> Option<String> {
+    None
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Signal {
     Hangup,
     Terminate,
     Kill,
+}
+
+/// Why a pane runtime ended, before application persistence policy is applied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildExitReason {
+    Exited,
+    Interrupted,
+    /// Imported runtimes have no child wait handle in the replacement server.
+    #[cfg(unix)]
+    Handoff,
+    WaitFailed,
+}
+
+impl ChildExitReason {
+    pub(crate) fn requires_session_checkpoint(self) -> bool {
+        match self {
+            Self::Interrupted => true,
+            #[cfg(unix)]
+            Self::Handoff => true,
+            _ => false,
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(crate) use unix_common::{
+    classify_child_exit, poll_fd_readable, read_fd, shared_ssh_control_path,
+};
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn classify_child_exit(_status: &portable_pty::ExitStatus) -> ChildExitReason {
+    ChildExitReason::Exited
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn launch_executable() -> std::io::Result<std::path::PathBuf> {
+    std::env::current_exe()
 }
 
 pub(crate) fn detached_custom_command_process(command: &str) -> std::process::Command {
@@ -39,6 +197,38 @@ pub(crate) fn apply_pane_runtime_marker(command: &mut portable_pty::CommandBuild
     apply_pane_runtime_marker_platform(command);
 }
 
+pub(crate) fn prepare_paste_text_for_pty(text: String) -> String {
+    prepare_paste_text_for_pty_platform(text)
+}
+
+pub(crate) fn plugin_runtime_path(path: &std::path::Path) -> std::path::PathBuf {
+    plugin_runtime_path_platform(path)
+}
+
+pub(crate) fn normalize_cwd_for_launch(path: &std::path::Path) -> std::path::PathBuf {
+    normalize_cwd_for_launch_platform(path)
+}
+
+#[cfg(not(windows))]
+fn normalize_cwd_for_launch_platform(path: &std::path::Path) -> std::path::PathBuf {
+    path.to_path_buf()
+}
+
+#[cfg(not(windows))]
+fn plugin_runtime_path_platform(path: &std::path::Path) -> std::path::PathBuf {
+    path.to_path_buf()
+}
+
+#[cfg(not(windows))]
+fn prepare_paste_text_for_pty_platform(text: String) -> String {
+    text
+}
+
+#[cfg(not(windows))]
+pub(crate) fn terminal_title_for_presentation(title: &str) -> &str {
+    title
+}
+
 #[cfg(not(windows))]
 fn apply_pane_runtime_marker_platform(_command: &mut portable_pty::CommandBuilder) {}
 
@@ -52,7 +242,6 @@ fn configure_background_command_platform(_command: &mut std::process::Command) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PlatformCapabilities {
     pub(crate) live_handoff: bool,
-    pub(crate) remote_attach: bool,
     pub(crate) direct_terminal_attach: bool,
     pub(crate) preserve_legacy_doubled_escape_input: bool,
 }
@@ -60,10 +249,35 @@ pub(crate) struct PlatformCapabilities {
 pub(crate) const fn capabilities() -> PlatformCapabilities {
     PlatformCapabilities {
         live_handoff: cfg!(unix),
-        remote_attach: cfg!(unix),
         direct_terminal_attach: cfg!(unix),
         preserve_legacy_doubled_escape_input: cfg!(target_os = "macos"),
     }
+}
+
+/// The byte the host terminal sends for Backspace according to the tty's erase
+/// setting (e.g. `^H` for MobaXterm and PuTTY-style terminals), when known.
+pub(crate) fn terminal_erase_byte() -> Option<u8> {
+    #[cfg(unix)]
+    return unix_common::terminal_erase_byte();
+    #[cfg(not(unix))]
+    None
+}
+
+pub(crate) fn terminal_grid_size() -> std::io::Result<(u16, u16)> {
+    #[cfg(unix)]
+    let (cols, rows) = unix_common::read_terminal_grid_size()?;
+    #[cfg(windows)]
+    let (cols, rows) = windows::read_terminal_grid_size()?;
+    #[cfg(not(any(unix, windows)))]
+    let (cols, rows) = fallback::read_terminal_grid_size()?;
+
+    if cols == 0 || rows == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "terminal reported a zero-sized grid",
+        ));
+    }
+    Ok((cols, rows))
 }
 
 #[cfg(not(windows))]
@@ -71,9 +285,17 @@ pub fn launch_server_daemon_command(command: &mut std::process::Command) -> std:
     command.spawn().map(|child| child.id())
 }
 
+#[cfg(not(target_os = "macos"))]
+pub(crate) fn prepare_server_process(_handoff_import: bool) -> std::io::Result<bool> {
+    Ok(false)
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub fn detach_server_daemon_command(command: &mut std::process::Command) {
     use std::os::unix::process::CommandExt;
+
+    #[cfg(target_os = "macos")]
+    macos::configure_server_daemon_context(command);
 
     unsafe {
         command.pre_exec(|| {
@@ -137,14 +359,11 @@ pub struct ClipboardCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-// Windows does not wire clipboard-image bridging into semantic input yet.
-#[cfg_attr(windows, allow(dead_code))]
 pub struct ClipboardImage {
     pub bytes: Vec<u8>,
     pub extension: &'static str,
 }
 
-#[cfg(unix)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum LimitedRead {
     Empty,
@@ -152,7 +371,6 @@ pub(crate) enum LimitedRead {
     Oversized,
 }
 
-#[cfg(unix)]
 pub(crate) fn read_limited_reader(
     mut reader: impl std::io::Read,
     max_bytes: usize,
@@ -190,6 +408,55 @@ pub(crate) fn read_limited_reader(
     }
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteSshConfigPaths {
+    pub(crate) user_config: Option<std::path::PathBuf>,
+    pub(crate) system_config: Option<std::path::PathBuf>,
+    pub(crate) multiplexing: bool,
+}
+
+pub(crate) const REMOTE_BRIDGE_IDLE_TIMEOUT_SUPPORTED: bool =
+    cfg!(any(target_os = "linux", target_os = "macos"));
+
+#[cfg(unix)]
+mod remote_bridge;
+#[cfg(all(test, unix))]
+mod remote_bridge_tests;
+#[cfg(unix)]
+mod unix_common;
+/// Other Unix platforms keep their existing input admission policy.
+/// Their _PC_MAX_CANON values need not describe the actual queue capacity.
+#[cfg(all(unix, not(target_os = "macos")))]
+#[derive(Clone, Default)]
+pub(crate) struct PtyInputGuard;
+
+#[cfg(all(unix, not(target_os = "macos")))]
+impl PtyInputGuard {
+    pub(crate) fn new(_master: &std::sync::Arc<std::fs::File>) -> Self {
+        Self
+    }
+
+    pub(crate) fn validate(&self, _bytes: &[u8]) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+#[cfg(unix)]
+pub(crate) mod unix_image_files;
+#[cfg(unix)]
+pub(crate) use unix_common::{
+    begin_cli_output, end_cli_output, forward_remote_bridge_stdio, ignore_server_hangup,
+    local_stream_peer_description, spawn_server_signal_monitor, RemoteBridgeWake,
+};
+
+mod client_state;
+pub(crate) use client_state::{create_private_state_file, replace_file, sync_parent_directory};
+
+#[cfg(not(unix))]
+pub(crate) fn begin_cli_output() {}
+
+#[cfg(not(unix))]
+pub(crate) fn end_cli_output() {}
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
@@ -204,6 +471,9 @@ pub use macos::*;
 mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::*;
+
+#[cfg(not(windows))]
+pub(crate) use process_cwd as pane_process_cwd;
 
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 mod fallback;
@@ -263,6 +533,7 @@ pub(crate) fn interactive_unix_shell_command(
 
 pub(crate) fn quote_powershell_arg(value: &str) -> String {
     if !value.is_empty()
+        && !value.starts_with('-')
         && value.bytes().all(|byte| {
             byte.is_ascii_alphanumeric()
                 || matches!(byte, b'_' | b'-' | b'.' | b'/' | b':' | b'+' | b'=')
@@ -271,6 +542,35 @@ pub(crate) fn quote_powershell_arg(value: &str) -> String {
         return value.to_string();
     }
     format!("'{}'", value.replace('\'', "''"))
+}
+
+pub(crate) fn quote_windows_command_line_arg(value: &str) -> String {
+    if !value.is_empty()
+        && !value
+            .chars()
+            .any(|ch| matches!(ch, ' ' | '\t' | '\n' | '\x0b' | '"'))
+    {
+        return value.to_string();
+    }
+
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0;
+    for ch in value.chars() {
+        if ch == '\\' {
+            backslashes += 1;
+            continue;
+        }
+        if ch == '"' {
+            quoted.push_str(&"\\".repeat(backslashes * 2 + 1));
+        } else {
+            quoted.push_str(&"\\".repeat(backslashes));
+        }
+        backslashes = 0;
+        quoted.push(ch);
+    }
+    quoted.push_str(&"\\".repeat(backslashes * 2));
+    quoted.push('"');
+    quoted
 }
 
 pub(crate) fn is_pane_shell_process_name(name: &str) -> bool {
@@ -359,9 +659,124 @@ impl PrefixInputSource for RealPrefixInputSource {
     }
 }
 
+#[cfg(all(test, any(unix, windows)))]
+#[test]
+fn child_exit_classification_only_checkpoints_interruptions() {
+    for code in [0, 1, 130, 255, 0xC0000005] {
+        let reason = classify_child_exit(&portable_pty::ExitStatus::with_exit_code(code));
+        assert_eq!(reason, ChildExitReason::Exited, "exit code {code:#x}");
+        assert!(!reason.requires_session_checkpoint());
+    }
+    #[cfg(windows)]
+    let status = portable_pty::ExitStatus::with_exit_code(0xC000013A);
+    #[cfg(not(windows))]
+    let status = portable_pty::ExitStatus::with_signal("Terminated: 15");
+    assert_eq!(classify_child_exit(&status), ChildExitReason::Interrupted);
+    assert!(classify_child_exit(&status).requires_session_checkpoint());
+    #[cfg(unix)]
+    assert!(ChildExitReason::Handoff.requires_session_checkpoint());
+    assert!(!ChildExitReason::WaitFailed.requires_session_checkpoint());
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_pane_process_group_rejects_processes_outside_the_pane_session() {
+        use std::os::unix::process::CommandExt;
+
+        let mut detached = std::process::Command::new("sleep");
+        detached.arg("30");
+        // SAFETY: setsid is async-signal-safe and touches only the child.
+        unsafe {
+            detached.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let mut detached = detached.spawn().expect("spawn detached");
+        let token = process_start_token(detached.id()).expect("start token");
+        let mut gone = std::process::Command::new("true").spawn().expect("spawn");
+        let gone_pid = gone.id();
+        gone.wait().expect("reap");
+
+        assert_eq!(
+            live_pane_process_group(std::process::id(), detached.id(), token),
+            None,
+            "a live process in another terminal session"
+        );
+        assert_eq!(
+            live_pane_process_group(gone_pid, detached.id(), token),
+            None,
+            "a pane shell that is gone"
+        );
+        let _ = detached.kill();
+        let _ = detached.wait();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn live_pane_process_group_follows_the_agent_process_not_its_job() {
+        use std::os::unix::process::CommandExt;
+
+        let shell_pid = std::process::id();
+        let mut wrapper = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .expect("spawn wrapper");
+        let job = wrapper.id();
+        let mut agent = std::process::Command::new("sleep")
+            .arg("30")
+            .process_group(job as i32)
+            .spawn()
+            .expect("spawn agent");
+        let agent_pid = agent.id();
+        let token = process_start_token(agent_pid).expect("agent start token");
+        let wrapper_token = process_start_token(job).expect("wrapper start token");
+
+        assert_eq!(
+            live_pane_process_group(shell_pid, agent_pid, token),
+            Some(job)
+        );
+        assert_eq!(
+            live_pane_process_group(shell_pid, agent_pid, token + 1),
+            None,
+            "a reused pid has a different start token"
+        );
+        unsafe {
+            libc::kill(agent_pid as libc::pid_t, libc::SIGSTOP);
+        }
+        assert_eq!(
+            live_pane_process_group(shell_pid, agent_pid, token),
+            Some(job)
+        );
+
+        unsafe {
+            libc::kill(agent_pid as libc::pid_t, libc::SIGKILL);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while live_pane_process_group(shell_pid, agent_pid, token).is_some()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            live_pane_process_group(shell_pid, agent_pid, token),
+            None,
+            "an unreaped agent must not count as alive while its wrapper lives"
+        );
+        assert_eq!(
+            live_pane_process_group(shell_pid, job, wrapper_token),
+            Some(job)
+        );
+        agent.wait().expect("reap agent");
+        assert_eq!(live_pane_process_group(shell_pid, agent_pid, token), None);
+        let _ = wrapper.kill();
+        let _ = wrapper.wait();
+    }
 
     #[test]
     fn terminal_resize_signal_is_recorded_once_per_delivery() {
@@ -514,3 +929,17 @@ mod tests {
         );
     }
 }
+
+#[cfg(not(unix))]
+pub(crate) fn shared_ssh_control_path(
+    _namespace: &std::path::Path,
+    _target: &str,
+) -> std::io::Result<std::path::PathBuf> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "interactive SSH recovery requires Unix OpenSSH multiplexing",
+    ))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn process_lite_profile(_pid: u32) -> Option<String> { None }

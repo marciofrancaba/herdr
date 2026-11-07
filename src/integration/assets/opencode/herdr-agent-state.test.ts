@@ -1,4 +1,7 @@
-import { beforeEach, expect, mock, test } from "bun:test";
+import { afterEach, beforeEach, expect, mock, test } from "bun:test";
+
+const originalArgv = process.argv;
+afterEach(() => { process.argv = originalArgv; });
 
 const requests: unknown[] = [];
 const clients: FakeClient[] = [];
@@ -43,6 +46,7 @@ beforeEach(() => {
   clients.length = 0;
   requestWaiters.length = 0;
   autoAcknowledge = true;
+  process.argv = ["bun", "/$bunfs/root/src/index.js", "run"];
   process.env.HERDR_ENV = "1";
   process.env.HERDR_SOCKET_PATH = "test.sock";
   process.env.HERDR_PANE_ID = "test:p1";
@@ -114,6 +118,37 @@ test("suppresses redundant same-session updates", async () => {
   expect(requests.map(requestSessionID)).toEqual(["root-session", "replacement-session"]);
 });
 
+test("does not classify server activity in another root session as a selection", async () => {
+  const plugin = await loadPlugin();
+
+  await plugin["chat.message"]({ sessionID: "visible-session" });
+  await plugin["chat.message"]({ sessionID: "attached-client-session" });
+
+  expect(requests.map(requestMethod)).toEqual([
+    "pane.report_agent",
+    "pane.report_agent",
+  ]);
+  expect(requests.map(requestSessionID)).toEqual([
+    "visible-session",
+    "attached-client-session",
+  ]);
+});
+
+test("does not classify server-global root creation as a local selection", async () => {
+  const plugin = await loadPlugin();
+
+  await plugin.event({
+    event: { type: "session.created", properties: { sessionID: "attached-session" } },
+  });
+  await plugin.event({
+    event: { type: "session.updated", properties: { sessionID: "attached-session" } },
+  });
+  await plugin["chat.message"]({ sessionID: "attached-session" });
+
+  expect(requests.map(requestMethod)).toEqual(["pane.report_agent"]);
+  expect(requests.map(requestSessionID)).toEqual(["attached-session"]);
+});
+
 test("reports retry status as working", async () => {
   const plugin = await loadPlugin();
 
@@ -136,7 +171,6 @@ test("reports child prompts without replacing the root session", async () => {
     event: {
       type: "session.created",
       properties: {
-        sessionID: "child-session",
         info: { id: "child-session", parentID: "root-session" },
       },
     },
@@ -157,17 +191,76 @@ test("reports child prompts without replacing the root session", async () => {
     "working",
   ]);
   expect(requests.map(requestSessionID)).toEqual([
-    undefined,
-    undefined,
-    undefined,
-    undefined,
-    undefined,
+    "root-session",
+    "root-session",
+    "root-session",
+    "root-session",
+    "root-session",
   ]);
+});
+
+test("routes nested child prompts to their own root, not the last active root", async () => {
+  const plugin = await loadPlugin();
+  for (const info of [
+    { id: "child-session", parentID: "root-session" },
+    { id: "nested-session", parentID: "child-session" },
+  ]) {
+    await plugin.event({ event: { type: "session.created", properties: { info } } });
+  }
+  await plugin["chat.message"]({ sessionID: "other-root" });
+  await plugin.event({
+    event: { type: "permission.asked", properties: { sessionID: "nested-session" } },
+  });
+  await plugin.event({
+    event: { type: "permission.replied", properties: { sessionID: "nested-session" } },
+  });
+  await plugin.event({
+    event: { type: "session.idle", properties: { sessionID: "nested-session" } },
+  });
+  await plugin["chat.message"]({ sessionID: "nested-session" });
+
+  expect(requests.map(requestState)).toEqual(["working", "blocked", "working"]);
+  expect(requests.map(requestSessionID)).toEqual([
+    "other-root",
+    "root-session",
+    "root-session",
+  ]);
+});
+
+test("only local run and Mini own server lifecycle, never shared servers or TUI workers", async () => {
+  for (const args of [
+    ["run"], ["run", "--session", "existing"], ["--mini"], ["--mini", "--session", "existing"],
+    ["--print-logs", "--log-level", "DEBUG", "run"], ["run", "--", "--attach"],
+  ]) {
+    process.argv = ["bun", "/$bunfs/root/src/index.js", ...args];
+    expect((await loadPlugin()).event).toBeFunction();
+  }
+  for (const args of [
+    [], ["--session", "existing"], ["serve"], ["web"], ["attach", "http://localhost:4096"],
+    ["run", "--attach", "http://localhost:4096"], ["--mini", "--attach=http://localhost:4096"],
+    ["serve", "--", "--mini"],
+  ]) {
+    process.argv = ["bun", "/$bunfs/root/src/index.js", ...args];
+    expect(await loadPlugin()).toEqual({});
+  }
+  process.argv = ["bun", "/$bunfs/root/src/cli/tui/worker.js"];
+  expect(await loadPlugin()).toEqual({});
+  expect(requests).toHaveLength(0);
 });
 
 function requestMethod(request: unknown): unknown {
   return isRecord(request) ? request.method : undefined;
 }
+
+test("dual server entrypoint keeps V1 hooks and never reports from the V2 shared server", async () => {
+  const module = await import(`./herdr-agent-state.js?test=${++importCounter}`);
+  expect(module.default.server).toBe(module.HerdrAgentStatePlugin);
+  expect(await module.default.setup({})).toBeUndefined();
+  expect(requests).toHaveLength(0);
+  const hooks = await module.default.server();
+  await hooks["chat.message"]({ sessionID: "v1-root" });
+  expect(requests.map(requestState)).toEqual(["working"]);
+});
 
 function requestState(request: unknown): unknown {
   return requestParam(request, "state");

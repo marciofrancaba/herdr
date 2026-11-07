@@ -89,7 +89,9 @@ pub(super) struct IdleScreenScanSkipInput {
 }
 
 pub(super) fn should_skip_idle_screen_scan(input: IdleScreenScanSkipInput) -> bool {
-    if input.state != AgentState::Idle
+    let stable_state = input.state == AgentState::Idle
+        || (input.state == AgentState::Unknown && input.agent == Some(Agent::Codex));
+    if !stable_state
         || input.agent.is_none()
         || input.pending_idle_active
         || input.agent_changed
@@ -100,6 +102,48 @@ pub(super) fn should_skip_idle_screen_scan(input: IdleScreenScanSkipInput) -> bo
 
     input.current_detection_content_seq.is_some()
         && input.last_screen_scan_detection_content_seq == input.current_detection_content_seq
+}
+
+/// Retains text, not a classification: callers still evaluate discovery and
+/// lifecycle bookkeeping on every scheduled observation.
+#[derive(Default)]
+pub(super) struct DetectionTextCache {
+    pub(super) text: String,
+    revision: Option<u64>,
+}
+
+impl DetectionTextCache {
+    pub(super) fn clear(&mut self) {
+        self.text.clear();
+        self.revision = None;
+    }
+
+    /// Returns whether the extracted text changed, not whether PTY bytes arrived.
+    pub(super) fn refresh(
+        &mut self,
+        agent: Option<Agent>,
+        content_seq: &AtomicU64,
+        read: impl FnOnce() -> (String, bool),
+    ) -> bool {
+        let before = content_seq.load(Ordering::Acquire);
+        // Identified agents retain their existing screen-read behavior everywhere.
+        if agent.is_none()
+            // The terminal accessor also returns empty on failure; keep retrying it.
+            && !self.text.is_empty()
+            && before.is_multiple_of(2)
+            && self.revision == Some(before)
+        {
+            return false;
+        }
+        let (text, reusable) = read();
+        let after = content_seq.load(Ordering::Acquire);
+        // Writers announce themselves before touching the terminal. A read that
+        // overlaps a writer must not bless either revision for future reuse.
+        self.revision = (reusable && before == after && before.is_multiple_of(2)).then_some(before);
+        let changed = text != self.text;
+        self.text = text;
+        changed
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,6 +360,23 @@ pub(super) fn detection_update_for_publish_with_osc(
     (!detection.skip_state_update).then_some(detection)
 }
 
+pub(super) fn codex_prompt_ready(content: &str) -> bool {
+    // The composer can remain visible during a turn; this is startup evidence only.
+    let recent: String = content
+        .lines()
+        .rev()
+        .take(12)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .flat_map(str::chars)
+        .filter(|ch| !ch.is_whitespace())
+        .collect();
+    recent.contains("›AskCodextodoanything")
+        && !recent.contains("model:loading")
+        && !recent.contains("Resumingsession")
+}
+
 pub(super) fn observe_detection_content_change(bytes: &[u8], detection_content_seq: &AtomicU64) {
     if !bytes.is_empty() {
         detection_content_seq.fetch_add(1, Ordering::Relaxed);
@@ -329,6 +390,63 @@ pub(super) fn mark_detection_content_changed(detection_content_seq: &AtomicU64) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unidentified_text_cache_preserves_text_changes_and_forced_reads() {
+        let sequence = AtomicU64::new(0);
+        let mut cache = DetectionTextCache::default();
+        assert!(cache.refresh(None, &sequence, || ("one".into(), true)));
+        for _ in 0..20 {
+            assert!(!cache.refresh(None, &sequence, || panic!("unchanged text was extracted")));
+        }
+        sequence.store(2, Ordering::Release);
+        assert!(
+            !cache.refresh(None, &sequence, || ("one".into(), true)),
+            "bytes are not text changes"
+        );
+        sequence.store(4, Ordering::Release);
+        assert!(cache.refresh(None, &sequence, || ("two".into(), true)));
+        for _ in 0..2 {
+            let mut read = false;
+            assert!(!cache.refresh(Some(Agent::Codex), &sequence, || {
+                read = true;
+                ("two".into(), true)
+            }));
+            assert!(read, "identified agents must keep their existing reads");
+        }
+        cache.clear();
+        assert!(cache.refresh(None, &sequence, || ("two".into(), true)));
+        sequence.store(6, Ordering::Release);
+        assert!(cache.refresh(None, &sequence, || (String::new(), false)));
+        assert!(cache.refresh(None, &sequence, || ("retry after empty read".into(), true)));
+    }
+
+    #[test]
+    fn unidentified_text_cache_does_not_reuse_overlapping_writes() {
+        let sequence = AtomicU64::new(0);
+        let mut cache = DetectionTextCache::default();
+        assert!(cache.refresh(None, &sequence, || {
+            sequence.store(2, Ordering::Release);
+            ("old".into(), true)
+        }));
+        assert_eq!(
+            cache.revision, None,
+            "old text must not acquire the new revision"
+        );
+        assert!(cache.refresh(None, &sequence, || ("new".into(), true)));
+
+        sequence.store(3, Ordering::Release);
+        assert!(cache.refresh(None, &sequence, || ("during write".into(), true)));
+        assert_eq!(
+            cache.revision, None,
+            "an in-progress write cannot be reused"
+        );
+        sequence.store(4, Ordering::Release);
+        assert!(cache.refresh(None, &sequence, || ("completed write".into(), true)));
+        assert!(!cache.refresh(None, &sequence, || panic!(
+            "completed revision should be reusable"
+        )));
+    }
 
     fn publish_state(state: AgentState) -> DetectionPublishState {
         DetectionPublishState {
@@ -380,10 +498,43 @@ mod tests {
     }
 
     #[test]
+    fn codex_startup_prompt_survives_terminal_wraps() {
+        let wrapped = "header\n› Ask Codex to do\nanything\nfooter";
+        assert!(codex_prompt_ready(wrapped));
+        assert!(!codex_prompt_ready(&format!("model: load\ning\n{wrapped}")));
+    }
+
+    #[test]
     fn screen_read_skips_unchanged_idle_bottom_buffer() {
         assert_eq!(
             decide_detection_screen_read(screen_read_input(AgentState::Idle, 10)),
             DetectionScreenReadDecision::Skip
+        );
+    }
+
+    #[test]
+    fn screen_read_skips_unchanged_ambiguous_codex_but_not_new_content_or_replacement() {
+        let mut input = screen_read_input(AgentState::Unknown, 10);
+        assert_eq!(
+            decide_detection_screen_read(input),
+            DetectionScreenReadDecision::Skip
+        );
+        input.current_detection_content_seq = Some(11);
+        assert_eq!(
+            decide_detection_screen_read(input),
+            DetectionScreenReadDecision::Read
+        );
+        input.current_detection_content_seq = Some(10);
+        input.agent_changed = true;
+        assert_eq!(
+            decide_detection_screen_read(input),
+            DetectionScreenReadDecision::Read
+        );
+        input.agent_changed = false;
+        input.agent = Some(Agent::Pi);
+        assert_eq!(
+            decide_detection_screen_read(input),
+            DetectionScreenReadDecision::Read
         );
     }
 

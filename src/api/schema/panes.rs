@@ -2,11 +2,18 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) const PANE_GRAPHICS_SET_MAX_BYTES: usize = 512 * 1024;
-pub(crate) const PANE_GRAPHICS_STREAM_MAX_BYTES: usize = 16 * 1024 * 1024;
-
 use super::agents::AgentSessionInfo;
 use super::common::{AgentStatus, PaneAgentState, ReadFormat, ReadSource, SplitDirection};
+
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneRightClickTarget {
+    #[default]
+    Herdr,
+    Pane,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneSplitParams {
@@ -21,8 +28,27 @@ pub struct PaneSplitParams {
     pub cwd: Option<String>,
     #[serde(default)]
     pub focus: bool,
+    #[serde(default)]
+    pub right_click: PaneRightClickTarget,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneInputSetParams {
+    pub pane_id: String,
+    pub right_click: PaneRightClickTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneLinkActivateParams {
+    pub pane_id: String,
+    pub viewport_row: u16,
+    pub col: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset_from_bottom: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -208,6 +234,75 @@ pub struct PaneResizeParams {
     pub amount: Option<f32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneScrollParams {
+    pub pane_id: String,
+    pub offset_from_bottom: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneTextPoint {
+    pub row: u32,
+    pub col: u16,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneSelectionReadParams {
+    pub pane_id: String,
+    pub anchor: PaneTextPoint,
+    pub cursor: PaneTextPoint,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneCopyMotion {
+    LineEnd,
+    FirstNonBlank,
+    NextWordStart,
+    PreviousWordStart,
+    NextWordEnd,
+    NextBigWordStart,
+    PreviousBigWordStart,
+    NextBigWordEnd,
+    PreviousParagraph,
+    NextParagraph,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneCopyMotionParams {
+    pub pane_id: String,
+    pub cursor: PaneTextPoint,
+    pub motion: PaneCopyMotion,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content_revision: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneCopySearchDirection {
+    Forward,
+    Backward,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneTextRange {
+    pub start: PaneTextPoint,
+    pub end: PaneTextPoint,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneCopySearchParams {
+    pub pane_id: String,
+    pub query: String,
+    pub direction: PaneCopySearchDirection,
+    pub cursor: PaneTextPoint,
+    pub content_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous: Option<PaneTextRange>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct PaneListParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -263,58 +358,6 @@ pub struct PaneReadParams {
     pub(crate) intent: super::common::ReadIntent,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-#[serde(rename_all = "snake_case")]
-pub enum PaneGraphicsFormat {
-    Png,
-    Rgb,
-    Rgba,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct PaneGraphicsSetParams {
-    pub pane_id: String,
-    #[serde(skip)]
-    #[schemars(skip)]
-    pub owner: String,
-    pub format: PaneGraphicsFormat,
-    pub image_width: u32,
-    pub image_height: u32,
-    #[serde(skip)]
-    pub data: Option<Vec<u8>>,
-    #[serde(default)]
-    pub data_base64: String,
-    #[serde(default)]
-    pub placement: PaneGraphicsPlacementParams,
-}
-
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default,
-)]
-pub struct PaneGraphicsPlacementParams {
-    #[serde(default)]
-    pub viewport_col: i32,
-    #[serde(default)]
-    pub viewport_row: i32,
-    #[serde(default)]
-    pub grid_cols: u32,
-    #[serde(default)]
-    pub grid_rows: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct PaneGraphicsClearParams {
-    pub pane_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
-pub struct PaneGraphicsStreamParams {
-    pub pane_id: String,
-    #[serde(skip)]
-    #[schemars(skip)]
-    pub owner: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneReportAgentParams {
     pub pane_id: String,
@@ -329,6 +372,10 @@ pub struct PaneReportAgentParams {
     pub agent_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_session_path: Option<String>,
+    /// Command that resumes this agent's session after a Herdr restart. The
+    /// first element must be a plain command name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_argv: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -344,6 +391,10 @@ pub struct PaneReportAgentSessionParams {
     pub agent_session_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_start_source: Option<String>,
+    /// Command that resumes this agent's session after a Herdr restart. The
+    /// first element must be a plain command name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_argv: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -405,6 +456,8 @@ pub struct PaneInfo {
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub foreground_cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -632,4 +685,12 @@ pub struct PaneReadResult {
     pub text: String,
     pub revision: u64,
     pub truncated: bool,
+}
+
+/// Inclusive display-cell columns on a pane's current viewport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PaneLinkRegion {
+    pub row: u16,
+    pub start_col: u16,
+    pub end_col: u16,
 }

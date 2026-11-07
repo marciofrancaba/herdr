@@ -103,7 +103,7 @@ Raw socket method names use dot notation:
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |
 | Worktree | `worktree.list`, `worktree.create`, `worktree.open`, `worktree.remove` |
 | Tab | `tab.create`, `tab.list`, `tab.get`, `tab.focus`, `tab.rename`, `tab.move`, `tab.close` |
-| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.graphics.info`, `pane.graphics.set`, `pane.graphics.clear`, `pane.graphics.stream`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
+| Pane | `pane.split`, `pane.swap`, `pane.move`, `pane.zoom`, `pane.layout`, `pane.process_info`, `pane.neighbor`, `pane.edges`, `pane.focus_direction`, `pane.resize`, `pane.list`, `pane.current`, `pane.get`, `pane.rename`, `pane.send_text`, `pane.send_keys`, `pane.send_input`, `pane.read`, `pane.report_agent`, `pane.report_agent_session`, `pane.report_metadata`, `pane.clear_agent_authority`, `pane.release_agent`, `pane.close`, `pane.wait_for_output` |
 | Popup | `popup.close` |
 | Layout | `layout.export`, `layout.apply`, `layout.set_split_ratio` |
 | Agent | `agent.list`, `agent.get`, `agent.read`, `agent.explain`, `agent.send_keys`, `agent.prompt`, `agent.wait`, `agent.rename`, `agent.focus`, `agent.start`, `agent.view.set`, `agent.view.clear` |
@@ -111,18 +111,19 @@ Raw socket method names use dot notation:
 | Integrations | `integration.install`, `integration.uninstall` |
 | Plugins | `plugin.link`, `plugin.list`, `plugin.unlink`, `plugin.enable`, `plugin.disable`, `plugin.action.list`, `plugin.action.invoke`, `plugin.log.list`, `plugin.pane.open`, `plugin.pane.focus`, `plugin.pane.close` |
 
-`agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this submits the prompt and starts the wait in one request, avoiding a race between separate calls.
+`agent.wait` is server-owned and event-driven. It pins the resolved pane occupant so a replacement cannot satisfy the wait. `agent.prompt` accepts an optional `wait` object with `until` and `timeout_ms`; this submits the prompt and starts the wait in one request, avoiding a race between separate calls. If the resolved agent is already `blocked`, `agent.prompt` returns `agent_blocked` without sending input or starting the wait.
 
 `workspace.move_block` atomically moves the ordered `workspace_ids` before `before_workspace_id`; omit the anchor to move the block to the end. The ids must be unique and the anchor cannot be part of the block. The response contains the authoritative ordered workspace list.
 
 `session.snapshot` returns a one-time bootstrap snapshot for clients that keep
 their own local runtime cache. The response includes version/protocol metadata,
 focused workspace/tab/pane ids, workspace records, tab records, pane records,
-tab layout snapshots, and agent records. It is not a subscription; after reading
-it, subscribe to resource events and update the local cache from those events.
-Call `session.snapshot` again after reconnecting or when the local cache may be
-stale. Attached worktree provenance is included on workspace records. Full repo
-worktree discovery remains `worktree.list`.
+tab layout snapshots, and agent records. It is not a subscription. For cache
+bootstrap and recovery, subscribe first, then reconcile through authoritative
+reads as described under Event subscriptions below. Events invalidate cached state; they
+cannot be unconditionally replayed over a snapshot. Call `session.snapshot`
+again after reconnecting or when the local cache may be stale. Attached worktree provenance is included on workspace
+records. Full repo worktree discovery remains `worktree.list`.
 
 From the CLI, `herdr api snapshot` prints the live `session.snapshot` response
 as JSON for clients and agents that want a simple bootstrap command.
@@ -137,6 +138,8 @@ like `ctrl+h`, `control+j`, `alt+x`, and `shift+tab`, function keys like
 `f1`, and named punctuation like `minus` and `plus`. They do not accept
 `prefix+` binding strings.
 
+On macOS, `pane.send_input` (used by `pane run`) and `agent.start` check the terminal's current canonical input limit before accepting a command into the input queue. An oversized encoded line, including Enter, is rejected in full; wait for the shell prompt and retry. Multiple short lines and raw-mode input remain supported. Successful responses still acknowledge queue admission, not command execution. This check covers the current submission only: it cannot inspect an earlier incomplete line or guarantee the terminal mode will remain unchanged while input is queued.
+
 ```json
 {"id":"req_current","method":"pane.current","params":{"caller_pane_id":"w1:p1"}}
 {"id":"req_layout","method":"pane.layout","params":{"pane_id":"w1:p1"}}
@@ -145,12 +148,20 @@ like `ctrl+h`, `control+j`, `alt+x`, and `shift+tab`, function keys like
 {"id":"req_focus","method":"pane.focus_direction","params":{"direction":"right"}}
 {"id":"req_resize","method":"pane.resize","params":{"pane_id":"w1:p1","direction":"right","amount":0.1}}
 {"id":"req_zoom","method":"pane.zoom","params":{"pane_id":"w1:p1","mode":"toggle"}}
-{"id":"req_split","method":"pane.split","params":{"direction":"right","ratio":0.333,"env":{"HERDR_ROLE":"tests"}}}
+{"id":"req_input","method":"pane.input.set","params":{"pane_id":"w1:p1","right_click":"pane"}}
+{"id":"req_split","method":"pane.split","params":{"direction":"right","ratio":0.333,"right_click":"pane","env":{"HERDR_ROLE":"tests"}}}
 {"id":"req_process","method":"pane.process_info","params":{"pane_id":"w1:p1"}}
 ```
 
 `pane.current` returns a single `PaneInfo`. When `caller_pane_id` is present,
 Herdr returns that pane. When it is omitted, Herdr returns the active focused
+pane.
+
+`pane.input.set` sets `right_click` to `herdr` or `pane` for one pane. `herdr`
+is the default. `pane` forwards unmodified right-click hold and drag gestures
+when the application requests terminal mouse reporting; otherwise Herdr falls
+back to its pane menu. Right-clicking the pane frame always opens Herdr's menu.
+`pane.split` accepts the same optional `right_click` value for the newly created
 pane.
 
 `PaneInfo` includes `scroll` when terminal scroll metrics are available:
@@ -165,30 +176,16 @@ pane.
 
 Clients can treat `offset_from_bottom == 0` as at-bottom state.
 
-### Experimental pane graphics
+### Pane graphics
 
-Pane graphics let a plugin place image data over a pane. They are available
-only when `[experimental].kitty_graphics = true`; otherwise every pane graphics
-method returns `feature_disabled`. Calling `pane.graphics.info` returns the
-attached client's cell width and height in pixels without creating a graphics
-layer. `pane.graphics.set` accepts `png`, `rgb`, or `rgba` data in `data_base64`,
-and `pane.graphics.clear` removes the layer.
+Applications and plugins should emit the standard Kitty graphics protocol through
+their pane's terminal output. Herdr manages image placement, clipping, and
+visibility in compatible outer terminals.
 
-```json
-{"id":"graphics_info","method":"pane.graphics.info","params":{"pane_id":"w1:p1"}}
-{"id":"graphics_set","method":"pane.graphics.set","params":{"pane_id":"w1:p1","format":"png","image_width":800,"image_height":600,"data_base64":"...","placement":{"viewport_col":0,"viewport_row":0,"grid_cols":80,"grid_rows":30}}}
-{"id":"graphics_clear","method":"pane.graphics.clear","params":{"pane_id":"w1:p1"}}
-```
-
-For repeated frames, open a dedicated socket with `pane.graphics.stream`. After
-Herdr replies with `ok`, send one JSON header and then exactly `data_length` raw
-bytes per frame. A stream owns that pane's graphics layer until the socket
-closes; concurrent set, clear, or stream requests return `stream_conflict`.
-
-```json
-{"id":"graphics_stream","method":"pane.graphics.stream","params":{"pane_id":"w1:p1"}}
-{"format":"png","image_width":800,"image_height":600,"data_length":12345,"placement":{"viewport_col":0,"viewport_row":0,"grid_cols":80,"grid_rows":30}}
-```
+The external socket pane-overlay API has been removed: `pane.graphics.info`,
+`pane.graphics.set`, `pane.graphics.clear`, and `pane.graphics.stream` are no
+longer available. There is no replacement socket image API. Internal wire
+compatibility with older servers does not restore these public methods.
 
 `pane.layout` returns the tab layout snapshot with `workspace_id`, `tab_id`,
 `zoomed`, outer `area`, `focused_pane_id`, pane rects, and split rects/ratios.
@@ -340,7 +337,7 @@ Set or clear the foreground client's outer terminal window title:
 {"id":"req_title_clear","method":"client.window_title.clear","params":{}}
 ```
 
-`client.window_title.clear` restores Herdr's default title. The response is
+`client.window_title.clear` hands the title back to `ui.window_title`. The response is
 `type: "client_window_title"` with `changed` and reason `set`, `cleared`, or
 `no_foreground_client`.
 
@@ -367,6 +364,8 @@ Remove a linked checkout:
 Use at most one of `workspace_id` or `cwd` for `worktree.list`, `worktree.create`, and `worktree.open`; omit both to use the active workspace. Use exactly one of `path` or `branch` for `worktree.open`. Raw socket `cwd` and `path` values must be absolute; the CLI expands relative `--cwd` and `--path` values before sending requests. Workspace responses include optional `worktree` provenance when a workspace belongs to a Herdr worktree group. Worktree commands can emit `workspace.updated` when an existing workspace gains or changes worktree provenance.
 
 Worktree commands also emit lifecycle events. `worktree.create` emits `workspace.created`, `tab.created`, `pane.created`, and `worktree.created`. `worktree.open` emits `worktree.opened`, and it also emits workspace/tab/pane creation events when it opens a new Herdr workspace. `worktree.remove` emits `worktree.removed`; if the linked workspace is still open, it also emits `workspace.closed`.
+
+`workspace.close` rejects closing a primary workspace while linked-worktree workspaces are open unless its params include `"close_group": true`, returning `workspace_group_close_required` when explicit group intent is missing. An explicit group close emits one `workspace.closed` event for each workspace it closes.
 
 ## Agent view queries
 
@@ -414,9 +413,13 @@ Built-in filter fields are `status`, `workspace_id`, `tab_id`, `pane_id`,
 `agent`, `seen`, and `state_change_seq`. Use `{"token":"name"}` as a field to
 filter plugin-reported pane metadata. Values are strings, booleans, unsigned
 numbers, or a context object. Context values are `current_workspace_id` and
-`current_tab_id`, and may only be compared to the matching ID field. Effective
-status values are `idle`, `working`, `blocked`, `done`, and `unknown`; `done`
-means idle and not yet seen.
+`current_tab_id`, and may only be compared to the matching ID field. In a
+saved-machine client, the selected server's view applies to the combined agent
+list. Current workspace and tab context includes that selected machine, so an
+identical ID on another machine does not match; independent filter branches,
+such as `status` being `blocked`, still match agents on any connected machine.
+Effective status values are `idle`, `working`, `blocked`, `done`, and `unknown`;
+`done` means idle and not yet seen.
 
 Sort fields are `workspace_order`, `tab_order`, `pane_order`, `attention`,
 `status`, `agent`, `seen`, `state_change_seq`, or `{"token":"name"}`. Sorts are
@@ -445,10 +448,10 @@ A source mismatch leaves the active view unchanged. Set and clear responses use
 
 ## Plugin APIs
 
-The plugin API is an early host surface for executable workflow tools. A plugin
-is a package with a `herdr-plugin.toml` manifest. The manifest declares
-startup hooks, shareable actions, event hooks, terminal pane entrypoints, and
-link handlers. Startup hooks run once after restore when the API is ready.
+The plugin API is an early interface for executable workflow tools. A plugin is
+a package with a `herdr-plugin.toml` manifest. The manifest declares startup
+hooks, shareable actions, event hooks, terminal pane entrypoints, and link
+handlers. Startup hooks run once after restore when the API is ready.
 Actions and panes are manifest-only; runtime action registration and runtime
 argv pane creation are not part of v1.
 
@@ -457,11 +460,14 @@ Installed and linked plugins persist across restarts. Herdr writes a
 `plugin.unlink`, `plugin.enable`, and `plugin.disable`. The
 `herdr plugin install` and `herdr plugin link` CLIs also write the same registry
 when Herdr is not running, then startup loads it automatically. On startup,
-Herdr re-reads each
-manifest from its original path; if the file is missing or unparseable the entry
-is kept with a `warnings` field so `plugin.list` surfaces it.
+Herdr re-reads each manifest from its original path; if the file is missing or
+unparseable, the entry is kept with a `warnings` field so `plugin.list` surfaces
+it.
 
-Event hook `on` values are validated against the known Herdr event names at link time. An unrecognised name is not an error — the link still succeeds — but the returned plugin info includes a warning (e.g. `"unknown event 'worktree.craeted'"`). Check the `warnings` field in the `plugin.link` and `plugin.list` responses.
+Herdr validates event hook `on` values against known event names at link time.
+An unrecognised name does not block the link, but the returned plugin info
+includes a warning (e.g. `"unknown event 'worktree.craeted'"`). Check the
+`warnings` field in the `plugin.link` and `plugin.list` responses.
 
 Link a local plugin manifest:
 
@@ -517,7 +523,7 @@ field is missing, invalid, or newer than the running Herdr binary.
 
 Declare `platforms` at the top level with the OS identifiers (`linux`, `macos`,
 `windows`) your plugin supports. Omitting `platforms` is allowed for local
-development — `plugin.link` succeeds but the response includes a warning.
+development. `plugin.link` succeeds, but the response includes a warning.
 Individual build commands, actions, event hooks, panes, and link handlers can
 declare their own `platforms` to override the plugin-level list; if omitted they
 inherit from the plugin. Invoking an action or opening a pane whose effective
@@ -616,6 +622,11 @@ A successful response includes the same `id`:
 {"id":"req_1","result":{"type":"pong"}}
 ```
 
+For request lines that reach JSON decoding, error responses also echo the request's
+`id`, including when the method or parameters are invalid. If the JSON is invalid
+or has no unambiguous top-level string `id`, the error response uses an empty `id`.
+Transport errors, such as invalid UTF-8, can close the connection without a response.
+
 Event subscriptions keep the connection open after the initial response.
 
 ## Socket paths
@@ -660,7 +671,8 @@ Integrations report agent state with `pane.report_agent`.
 }
 ```
 
-`state` is semantic. It affects waits, notifications, and rollups. Report display-only values separately through metadata.
+`state` carries semantic agent state and affects waits, notifications, and
+rollups. Report display-only values separately through metadata.
 
 Session-only official integrations report native session references with `pane.report_agent_session`. State-reporting integrations can still include native session references in `pane.report_agent`. State-independent session reports do not affect waits, notifications, or rollups.
 
@@ -673,6 +685,22 @@ Session-only official integrations report native session references with `pane.r
     "source": "herdr:codex",
     "agent": "codex",
     "agent_session_id": "..."
+  }
+}
+```
+
+Both methods accept an optional `resume_argv` array with the command that resumes the reporter's current session after a Herdr server restart. Its first element must be a plain command name, not a path. It allows at most 64 elements and 8 KiB in total, and no element may contain an apostrophe or control character; invalid values fail with `invalid_resume_argv` and the report is not applied. A custom agent must hold the pane through `pane.report_agent` before it can attach a command; otherwise the request fails with `resume_not_accepted`. Herdr keeps the command only while the same `source` and `agent` hold the pane, and it takes precedence over Herdr's built-in resume command for that agent. Older Herdr versions ignore the field.
+
+```json
+{
+  "id": "req_3",
+  "method": "pane.report_agent_session",
+  "params": {
+    "pane_id": "w1:p1",
+    "source": "custom:my-agent",
+    "agent": "my-agent",
+    "agent_session_id": "...",
+    "resume_argv": ["my-agent", "--resume", "..."]
   }
 }
 ```
@@ -759,6 +787,34 @@ Subscribe to events when you need a long-lived stream:
 ```
 
 The first response acknowledges the subscription. Later lines are pushed events.
+All entries must be valid: if any referenced pane does not exist, Herdr rejects
+the entire request with an error and closes the connection. Refresh the pane list
+and retry rather than assuming the other entries were subscribed.
+Lifecycle subscriptions start when the request is accepted and do not replay
+events retained before that point.
+
+Lifecycle and agent-status events are drained in bounded batches, in order within
+each subscription. Event history is not durable. If a subscriber falls behind
+the retained history, including while its subscriptions are being initialized,
+the server sends an error response with the original request `id` and
+`error.code: "events_lost"`, then closes that subscription connection instead of
+silently continuing with missing events. Other clients remain connected.
+The history is shared across event types, so an overrun is reported even when
+the evicted events might not have matched this subscription's filters.
+
+On `events_lost`, treat the cached state as stale. Open a new subscription,
+wait for `subscription_started`, and keep reading while requesting
+`session.snapshot` on another connection. Use authoritative reads to reconcile
+current state: replace the cache with the snapshot, and treat incoming events
+as invalidation signals that trigger another read. Serialize refreshes and
+refresh again if events arrive while a read is in flight.
+
+Snapshots and events have no shared sequence boundary. Ordering is guaranteed
+within each subscription entry, not across entries or relative to a snapshot,
+so do not unconditionally replay buffered event payloads onto the snapshot.
+Recovery restores current state, not the missing event history. Another
+`events_lost` requires resubscribing and reconciling again. Slow readers may
+need to increase read throughput or reduce event load.
 
 Workspace event subscriptions include `workspace.created`, `workspace.updated`, `workspace.metadata_updated`, `workspace.renamed`, `workspace.moved`, `workspace.reordered`, `workspace.closed`, and `workspace.focused`. `workspace.metadata_updated` reports token changes and TTL expiry without invoking plugin event hooks. Other workspace events describe Herdr UI/runtime lifecycle. `workspace.created` includes optional `workspace.worktree` provenance when the workspace belongs to a worktree group. `workspace.moved` includes the moved `workspace_id`, requested `insert_index`, and updated ordered `workspaces` list. `workspace.reordered` includes the atomically moved `workspace_ids`, optional `before_workspace_id`, and authoritative ordered `workspaces` list. `workspace.closed` includes a final `workspace` snapshot when Herdr can still identify it before removal.
 Tab event subscriptions include `tab.created`, `tab.closed`, `tab.focused`,
@@ -768,14 +824,17 @@ that workspace.
 Pane event subscriptions include `pane.created`, `pane.updated`, `pane.closed`, `pane.focused`,
 `pane.moved`, `pane.exited`, `pane.agent_detected`,
 `pane.output_matched`, `pane.agent_status_changed`, and `pane.scroll_changed`.
+`pane.focused` also reports manual pane selection changes from any client attached
+to this server. It does not move other clients' views, and its payload does not
+identify the client. Selecting an already-selected pane does not emit it again.
 Terminal-title changes can emit `pane.updated`, but spinner-only raw-title changes do not emit it when `terminal_title_stripped` is unchanged.
 `pane.scroll_changed` is scoped to one `pane_id` and emits `pane_id`,
 `workspace_id`, and the current `scroll` metrics whenever Herdr observes a
 changed scroll snapshot.
 Layout event subscriptions include `layout.updated`. The event carries the
-updated `PaneLayoutSnapshot` for one tab. Clients that bootstrap with
-`session.snapshot` should replace the cached layout with the same
-`workspace_id` and `tab_id`.
+updated `PaneLayoutSnapshot` for one tab. Clients maintaining a cache with
+`session.snapshot` should use this event to refresh the affected layout through
+an authoritative read; a delayed payload may predate their latest snapshot.
 
 Worktree event subscriptions include `worktree.created`, `worktree.opened`, and `worktree.removed`. Worktree events describe Git checkout lifecycle. `worktree.created` includes the opened `workspace` and created `worktree`. `worktree.opened` includes the target `workspace`, opened `worktree`, and `already_open`. `worktree.removed` includes the `workspace_id`, removed `worktree`, and `forced`.
 
@@ -882,6 +941,18 @@ Errors look like this:
 
 ## Protocol stability
 
-Herdr has a protocol version for client/server compatibility. Protocol changes are reviewed with release compatibility in mind.
+The client-rendered Herdr UI uses a stable endpoint generation for local and SSH
+servers. Client and server builds do not need to match. During connection setup,
+they agree on the core snapshot, screen, input, and blob codecs, and the server advertises
+the API methods and optional capabilities it supports. Saved SSH federation requires the
+`surface_interest` capability so only the selected machine streams a pane surface and the
+`health_check` capability so a quiet broken connection cannot remain Online indefinitely. A server
+without this lifecycle support stays at Attention until it is explicitly updated. Other missing methods disable
+only those actions and show a client-local notice; they do not disconnect the UI. Rejected
+or timed-out actions are also reported without ending the connection. Servers
+from before endpoint generation 1 need one final update.
 
-Check the server protocol with `ping` or `herdr status` before depending on new behavior. Handle unknown fields gracefully.
+The numbered binary protocol remains for same-install and internal operations,
+including direct terminal attach and live handoff. Check `ping` or `herdr status`
+before using those operations across different builds. JSON API clients should
+ignore unknown fields and handle unsupported methods as normal errors.

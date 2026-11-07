@@ -89,10 +89,17 @@ impl App {
         });
         let root_leaf = first_layout_leaf(&params.root);
         let first_cwd = self.layout_root_cwd(ws_idx, replace_target, root_leaf);
-        let (rows, cols) = self.state.estimate_pane_size();
+        let pane_sizes = self
+            .state
+            .new_layout_pane_sizes(&final_tile_layout(&params.root));
+        // Sizes come from the same tree the panes are built from, in pane order.
+        let Some(&(rows, cols)) = pane_sizes.first() else {
+            return encode_error(id, "invalid_layout", "layout has no panes");
+        };
         let default_shell = self.state.default_shell.clone();
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
         let host_terminal_theme = self.state.host_terminal_theme;
+        let host_terminal_appearance = self.state.host_terminal_appearance;
         let extra_env = match super::env::normalize_launch_env(root_leaf.env.clone()) {
             Ok(env) => env,
             Err((code, message)) => return encode_error(id, &code, message),
@@ -115,6 +122,7 @@ impl App {
                     extra_env,
                     scrollback_limit_bytes,
                     host_terminal_theme,
+                    host_terminal_appearance,
                 )
             } else {
                 ws.create_tab(
@@ -123,6 +131,7 @@ impl App {
                     first_cwd,
                     scrollback_limit_bytes,
                     host_terminal_theme,
+                    host_terminal_appearance,
                     crate::pane::PaneShellConfig::new(&default_shell, self.state.shell_mode),
                     extra_env,
                 )
@@ -142,7 +151,9 @@ impl App {
         }
         self.apply_layout_pane_label(ws_idx, new_root_pane, root_leaf);
 
-        if let Err(message) = self.apply_layout_node_to_pane(ws_idx, new_root_pane, &params.root) {
+        if let Err(message) =
+            self.apply_layout_node_to_pane(ws_idx, new_root_pane, &params.root, &pane_sizes)
+        {
             self.rollback_layout_tab(ws_idx, new_root_pane);
             return encode_error(id, "layout_apply_failed", message);
         }
@@ -359,6 +370,7 @@ impl App {
         ws_idx: usize,
         pane_id: PaneId,
         node: &LayoutNode,
+        pane_sizes: &[(u16, u16)],
     ) -> Result<(), String> {
         match node {
             LayoutNode::Pane { pane } => {
@@ -371,16 +383,21 @@ impl App {
                 first,
                 second,
             } => {
-                let second_leaf = first_layout_leaf(second);
+                let (first_sizes, second_sizes) =
+                    pane_sizes.split_at(layout_leaf_count(first).min(pane_sizes.len()));
+                let Some(&size) = second_sizes.first() else {
+                    return Err("layout pane sizes do not match the layout".into());
+                };
                 let new_pane = self.layout_split_pane(
                     ws_idx,
                     pane_id,
                     direction.clone(),
                     *ratio,
-                    second_leaf,
+                    first_layout_leaf(second),
+                    size,
                 )?;
-                self.apply_layout_node_to_pane(ws_idx, pane_id, first)?;
-                self.apply_layout_node_to_pane(ws_idx, new_pane, second)
+                self.apply_layout_node_to_pane(ws_idx, pane_id, first, first_sizes)?;
+                self.apply_layout_node_to_pane(ws_idx, new_pane, second, second_sizes)
             }
         }
     }
@@ -392,11 +409,13 @@ impl App {
         direction: SplitDirection,
         ratio: f32,
         pane: &LayoutPane,
+        (rows, cols): (u16, u16),
     ) -> Result<PaneId, String> {
-        let (rows, cols) = self.state.estimate_pane_size();
+        let direction = layout_direction(&direction);
         let default_shell = self.state.default_shell.clone();
         let scrollback_limit_bytes = self.state.pane_scrollback_limit_bytes;
         let host_terminal_theme = self.state.host_terminal_theme;
+        let host_terminal_appearance = self.state.host_terminal_appearance;
         let cwd = pane
             .cwd
             .as_ref()
@@ -404,10 +423,6 @@ impl App {
             .or_else(|| self.launch_cwd_for_pane_in_workspace(ws_idx, target_pane_id));
         let extra_env = super::env::normalize_launch_env(pane.env.clone())
             .map_err(|(_, message)| message.to_string())?;
-        let direction = match direction {
-            SplitDirection::Right => Direction::Horizontal,
-            SplitDirection::Down => Direction::Vertical,
-        };
         let command = layout_command(pane)?;
         let result = {
             let Some(ws) = self.state.workspaces.get_mut(ws_idx) else {
@@ -425,6 +440,7 @@ impl App {
                     extra_env,
                     scrollback_limit_bytes,
                     host_terminal_theme,
+                    host_terminal_appearance,
                     false,
                 )
             } else {
@@ -437,6 +453,7 @@ impl App {
                     cwd,
                     scrollback_limit_bytes,
                     host_terminal_theme,
+                    host_terminal_appearance,
                     crate::pane::PaneShellConfig::new(&default_shell, self.state.shell_mode),
                     extra_env,
                     false,
@@ -507,6 +524,47 @@ impl App {
             self.shutdown_detached_terminal_runtimes();
         }
     }
+}
+
+fn layout_direction(direction: &SplitDirection) -> Direction {
+    match direction {
+        SplitDirection::Right => Direction::Horizontal,
+        SplitDirection::Down => Direction::Vertical,
+    }
+}
+
+fn layout_leaf_count(node: &LayoutNode) -> usize {
+    match node {
+        LayoutNode::Pane { .. } => 1,
+        LayoutNode::Split { first, second, .. } => {
+            layout_leaf_count(first) + layout_leaf_count(second)
+        }
+    }
+}
+
+/// The tab layout `root` will produce, with placeholder pane ids in pane order.
+fn final_tile_layout(root: &LayoutNode) -> crate::layout::TileLayout {
+    fn build(node: &LayoutNode, next_id: &mut u32) -> Node {
+        match node {
+            LayoutNode::Pane { .. } => {
+                *next_id += 1;
+                Node::Pane(PaneId::from_raw(*next_id))
+            }
+            LayoutNode::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            } => Node::Split {
+                direction: layout_direction(direction),
+                ratio: crate::layout::valid_split_ratio(*ratio),
+                first: Box::new(build(first, next_id)),
+                second: Box::new(build(second, next_id)),
+            },
+        }
+    }
+    let root = build(root, &mut 0);
+    crate::layout::TileLayout::from_saved(root, PaneId::from_raw(1))
 }
 
 fn first_layout_leaf(node: &LayoutNode) -> &LayoutPane {
@@ -602,7 +660,7 @@ mod tests {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &Config::default(),
-            true,
+            crate::app::AppPolicy::TEST,
             None,
             api_rx,
             crate::api::EventHub::default(),
@@ -718,6 +776,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn layout_apply_starts_every_pane_at_its_final_size() {
+        let mut app = app_with_workspace();
+        let area = ratatui::layout::Rect::new(0, 0, 120, 40);
+        crate::ui::compute_view_without_resizing_panes(
+            &mut app.state,
+            &app.terminal_runtimes,
+            area,
+        );
+        let pane = || {
+            Box::new(LayoutNode::Pane {
+                pane: LayoutPane::default(),
+            })
+        };
+        let split = |direction, ratio, first, second| {
+            Box::new(LayoutNode::Split {
+                direction,
+                ratio,
+                first,
+                second,
+            })
+        };
+        let root = split(
+            SplitDirection::Right,
+            0.6,
+            split(SplitDirection::Down, 0.3, pane(), pane()),
+            split(
+                SplitDirection::Down,
+                0.95,
+                pane(),
+                split(SplitDirection::Right, 0.5, pane(), pane()),
+            ),
+        );
+
+        let response = app.handle_layout_apply(
+            "req".into(),
+            LayoutApplyParams {
+                workspace_id: None,
+                tab_id: None,
+                tab_label: None,
+                focus: false,
+                root: *root,
+            },
+        );
+
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let tab_idx = app.state.workspaces[0].tabs.len() - 1;
+        assert_ne!(app.state.workspaces[0].active_tab_index(), tab_idx);
+        let sizes = |app: &App| {
+            app.state.workspaces[0].tabs[tab_idx]
+                .layout
+                .pane_ids()
+                .into_iter()
+                .map(|pane_id| {
+                    app.state
+                        .runtime_for_pane_in_workspace(&app.terminal_runtimes, 0, pane_id)
+                        .unwrap()
+                        .current_size()
+                })
+                .collect::<Vec<_>>()
+        };
+        let spawned = sizes(&app);
+        assert_eq!(spawned.len(), 5);
+        crate::ui::resize_tab_surface(
+            &app.state,
+            &app.terminal_runtimes,
+            0,
+            tab_idx,
+            area,
+            crate::kitty_graphics::HostCellSize::default(),
+        );
+        assert_eq!(sizes(&app), spawned);
+        shutdown_test_runtimes(&mut app);
+    }
+
+    #[tokio::test]
     async fn layout_apply_replaces_tab_with_requested_tree() {
         let mut app = app_with_workspace();
         let original_tab_id = app.public_tab_id(0, 0).unwrap();
@@ -741,7 +874,7 @@ mod tests {
                     second: Box::new(LayoutNode::Pane {
                         pane: LayoutPane {
                             label: Some("tests".into()),
-                            command: Some(vec!["sh".into(), "-c".into(), "true".into()]),
+                            command: Some(vec![exiting_test_command().into()]),
                             env: std::collections::HashMap::from([(
                                 "HERDR_ROLE".into(),
                                 "tests".into(),
@@ -783,7 +916,7 @@ mod tests {
         assert_eq!(second_pane.label.as_deref(), Some("tests"));
         assert_eq!(
             second_pane.command,
-            Some(vec!["sh".into(), "-c".into(), "true".into()])
+            Some(vec![exiting_test_command().into()])
         );
         assert!(matches!(
             &app.event_hub.events_after(0).last().expect("layout event").1.data,
