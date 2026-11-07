@@ -21,6 +21,8 @@ pub struct ServerSshAgentRegisterParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ServerCapabilities {
+    #[serde(default)]
+    pub workspace_identity: bool,
     pub live_handoff: bool,
     #[serde(default)]
     pub detached_server_daemon: bool,

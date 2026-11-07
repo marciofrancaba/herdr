@@ -26,6 +26,18 @@ impl HeadlessServer {
         &mut self,
         params: crate::api::schema::ServerLiveHandoffParams,
     ) -> io::Result<()> {
+        if self.persistence_pending()
+            || self
+                .app
+                .session_save_thread
+                .as_ref()
+                .is_some_and(|worker| !worker.is_finished())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "session writer is busy; handoff was not started",
+            ));
+        }
         info!("starting live handoff");
         let import_exe = params.import_exe.as_deref().map(std::path::PathBuf::from);
         let socket_path = crate::server::handoff::handoff_socket_path();
@@ -335,6 +347,10 @@ impl HeadlessServer {
     /// close client connections, remove socket files, and clean up.
     pub(super) async fn complete_shutdown(&mut self) -> io::Result<()> {
         info!("completing server shutdown");
+        // Release critical-event producers blocked by bounded backpressure.
+        // Closing does not replay queued lifecycle effects or write state.
+        self.app.event_rx.close();
+        self.app.api_rx.close();
         self.reject_late_client_connections().await;
 
         // Send ServerShutdown to all remaining clients.

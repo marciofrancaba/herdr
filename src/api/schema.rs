@@ -79,6 +79,8 @@ pub enum Method {
     WorkspaceCreate(WorkspaceCreateParams),
     #[serde(rename = "workspace.list")]
     WorkspaceList(EmptyParams),
+    #[serde(rename = "workspace.identity.ensure_durable")]
+    WorkspaceIdentityEnsureDurable(WorkspaceTarget),
     #[serde(rename = "workspace.get")]
     WorkspaceGet(WorkspaceTarget),
     #[serde(rename = "workspace.focus")]

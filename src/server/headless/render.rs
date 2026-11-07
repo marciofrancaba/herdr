@@ -456,6 +456,9 @@ impl HeadlessServer {
         let render_targets = render_targets(&self.clients, self.foreground_client_id);
 
         if render_targets.is_empty() {
+            if self.persistence_pending() {
+                return;
+            }
             let (cols, rows) = self.effective_size;
             let area = Rect::new(0, 0, cols, rows);
             let resize_panes = self.app.state.view.pane_infos.is_empty();
@@ -484,6 +487,9 @@ impl HeadlessServer {
         // Resize from the controlling client's geometry before drawing any observer.
         // Retained updates fall back here when a pane changes alternate screens.
         for (client_id, (cols, rows), cell_size, _, _) in &render_targets {
+            if self.persistence_pending() {
+                break;
+            }
             let Some(client) = self.clients.get(client_id) else {
                 continue;
             };

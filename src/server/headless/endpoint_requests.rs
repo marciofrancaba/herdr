@@ -7,6 +7,17 @@ impl HeadlessServer {
         boot_id: String,
         mut request: Box<api::schema::Request>,
     ) -> bool {
+        self.drain_all_internal_events_with_forwarding();
+        if self.persistence_pending() {
+            let message = crate::server::client_commands::error_message(
+                boot_id,
+                request.id,
+                "persistence_busy",
+                "Session persistence is pending; command was not applied",
+            );
+            self.send_to_client(client_id, message);
+            return false;
+        }
         let Some(client) = self.clients.get(&client_id) else {
             return false;
         };

@@ -2,6 +2,8 @@ use super::*;
 
 mod event_fairness;
 mod native_graphics;
+#[cfg(unix)]
+mod ordered_process;
 #[path = "pane_move.rs"]
 mod pane_move_tests;
 #[path = "pane_graphics.rs"]
@@ -55,7 +57,7 @@ fn client_agent_view_projection(
     serde_json::from_str(&data).expect("decode client agent view projection")
 }
 
-fn test_headless_server() -> HeadlessServer {
+pub(super) fn test_headless_server() -> HeadlessServer {
     test_headless_server_with_event_hub(api::EventHub::default())
 }
 
@@ -129,6 +131,7 @@ fn test_headless_server_with_event_hub(event_hub: api::EventHub) -> HeadlessServ
         headless_size,
         effective_size: headless_size,
         shutting_down: false,
+        ordered_persistence: Default::default(),
         host_shutdown_requested: Arc::new(AtomicBool::new(false)),
         host_shutdown_intent: Default::default(),
         host_shutdown_probe: crate::platform::host_shutdown_in_progress,

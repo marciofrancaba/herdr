@@ -80,6 +80,7 @@ mod endpoint_requests;
 mod lifecycle;
 mod native_graphics;
 mod notifications;
+mod ordered_persistence;
 mod render;
 mod retained_surface;
 mod surface_interest;
@@ -243,6 +244,7 @@ pub struct HeadlessServer {
     effective_size: (u16, u16),
     /// Flag set when shutdown is initiated.
     shutting_down: bool,
+    ordered_persistence: ordered_persistence::OrderedPersistence,
     /// Flag set while exporting live PTYs to a replacement server.
     handoff_in_progress: bool,
     /// Imported panes get one app-safe resize nudge after the first client attaches.
@@ -386,6 +388,7 @@ impl HeadlessServer {
             headless_size,
             effective_size: headless_size,
             shutting_down: false,
+            ordered_persistence: Default::default(),
             host_shutdown_requested: Arc::new(AtomicBool::new(false)),
             host_shutdown_intent: Default::default(),
             #[cfg(test)]
@@ -434,6 +437,27 @@ impl HeadlessServer {
         loop {
             crate::render_prof::event("loop.tick");
             crate::render_prof::flush_if_due();
+            self.poll_ordered_persistence();
+            if let Some(result) = self.ordered_persistence.shutdown_result.take() {
+                self.initiate_shutdown();
+                self.complete_shutdown().await?;
+                return result.map_err(|error| {
+                    io::Error::other(format!("shutdown persistence unknown: {error}"))
+                });
+            }
+            if self.persistence_pending() {
+                if self.ordered_stop_expired() {
+                    self.initiate_shutdown();
+                    self.complete_shutdown().await?;
+                    return Err(io::Error::other("stopped with session persistence unresolved; no final save or lifecycle replay"));
+                }
+                self.wait_ordered_persistence().await;
+                continue;
+            }
+            self.replay_ordered_controls();
+            if self.persistence_pending() {
+                continue;
+            }
             self.app.reap_finished_detached_processes();
 
             // If shutdown has been initiated, complete it and exit.
@@ -445,7 +469,7 @@ impl HeadlessServer {
             // Preserve the session before applying shutdown-time process exits.
             // On Linux, logind's delay lock stays held until the final session save.
             if self.host_shutdown_requested() {
-                self.initiate_shutdown();
+                self.begin_ordered_shutdown();
                 continue;
             }
 
@@ -454,7 +478,9 @@ impl HeadlessServer {
                 self.drain_internal_events_with_forwarding_up_to(
                     crate::app::APP_EVENT_CHANNEL_CAPACITY,
                 );
-                self.initiate_shutdown();
+                if !self.persistence_pending() {
+                    self.begin_ordered_shutdown();
+                }
                 continue;
             }
 
@@ -471,7 +497,7 @@ impl HeadlessServer {
                 needs_graphics_render = false;
                 crate::render_prof::event("full_render_cause.internal_events");
             }
-            if self.should_quit.load(Ordering::Acquire) {
+            if self.persistence_pending() || self.should_quit.load(Ordering::Acquire) {
                 continue;
             }
             if self.app.expire_due_metadata(Instant::now()) {
@@ -486,7 +512,7 @@ impl HeadlessServer {
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.api_requests");
             }
-            if self.should_quit.load(Ordering::Acquire) {
+            if self.persistence_pending() || self.should_quit.load(Ordering::Acquire) {
                 continue;
             }
 
@@ -502,7 +528,7 @@ impl HeadlessServer {
                 needs_full_render = true;
                 crate::render_prof::event("full_render_cause.server_events");
             }
-            if self.should_quit.load(Ordering::Acquire) {
+            if self.persistence_pending() || self.should_quit.load(Ordering::Acquire) {
                 continue;
             }
 
@@ -693,10 +719,9 @@ impl HeadlessServer {
             }
         }
 
-        // Save session on exit.
-        if self.app.policy.persist_session {
-            self.app.save_session_on_shutdown();
-        }
+        // Ordinary shutdown uses the ordered completion path above. A live
+        // handoff disables persistence before this legacy shutdown branch.
+        debug_assert!(!self.app.policy.persist_session);
 
         info!("headless server exiting");
         Ok(())
@@ -1026,6 +1051,9 @@ impl HeadlessServer {
     }
 
     fn remove_client_and_resize_if_needed(&mut self, client_id: u64) {
+        if self.persistence_pending() {
+            return;
+        }
         let restore_shell_controller = self.clients.get(&client_id).and_then(|client| {
             let ClientConnectionMode::TerminalAttach { terminal_id } = &client.mode else {
                 return None;
@@ -1065,7 +1093,7 @@ impl HeadlessServer {
     fn drain_server_events(&mut self) -> bool {
         let mut changed = false;
         for _ in 0..EXTERNAL_EVENT_DRAIN_LIMIT {
-            if self.should_quit.load(Ordering::Acquire) {
+            if self.persistence_pending() || self.should_quit.load(Ordering::Acquire) {
                 break;
             }
             let Ok(ev) = self.server_event_rx.try_recv() else {
@@ -2427,10 +2455,12 @@ impl HeadlessServer {
                     client
                         .track_shell_input(ClientShellInputTarget::Pane(pane_id.clone()), &events);
                 }
-                let foreground_changed =
-                    interaction && self.promote_client_to_foreground(client_id);
-                let geometry_changed =
-                    interaction && self.claim_shell_tab_geometry(client_id, false);
+                let foreground_changed = !self.persistence_pending()
+                    && interaction
+                    && self.promote_client_to_foreground(client_id);
+                let geometry_changed = !self.persistence_pending()
+                    && interaction
+                    && self.claim_shell_tab_geometry(client_id, false);
                 let Some(runtime) = self.app.state.runtime_for_pane_in_workspace(
                     &self.app.terminal_runtimes,
                     workspace_index,
@@ -2520,10 +2550,12 @@ impl HeadlessServer {
                         &events,
                     );
                 }
-                let foreground_changed =
-                    interaction && self.promote_client_to_foreground(client_id);
-                let geometry_changed =
-                    interaction && self.claim_shell_tab_geometry(client_id, false);
+                let foreground_changed = !self.persistence_pending()
+                    && interaction
+                    && self.promote_client_to_foreground(client_id);
+                let geometry_changed = !self.persistence_pending()
+                    && interaction
+                    && self.claim_shell_tab_geometry(client_id, false);
                 let Some(runtime) = self.app.terminal_runtimes.get(&popup_terminal_id) else {
                     return foreground_changed | geometry_changed;
                 };
@@ -2912,6 +2944,10 @@ impl HeadlessServer {
         skip_default_workspace_for_request: bool,
         client_local: bool,
     ) -> bool {
+        if self.persistence_pending() {
+            self.answer_during_persistence(msg);
+            return false;
+        }
         if self.shutting_down || self.host_shutdown_requested() {
             // During shutdown, respond with server_unavailable.
             Self::reject_api_request_for_shutdown(msg);
@@ -2983,9 +3019,23 @@ impl HeadlessServer {
                 &msg.request.method,
                 api::schema::Method::ServerStop(_) | api::schema::Method::ServerLiveHandoff(_)
             );
-        changed |= self.drain_all_internal_events_with_forwarding();
+        // Both public and client-shell wrappers drain before projecting focus.
+        // Draining here could suspend a lifecycle event after request effects.
+
         if self.host_shutdown_requested() {
             Self::reject_api_request_for_shutdown(msg);
+            return changed;
+        }
+
+        if self.persistence_pending() {
+            self.answer_during_persistence(msg);
+            return changed;
+        }
+        if matches!(
+            &msg.request.method,
+            api::schema::Method::WorkspaceIdentityEnsureDurable(_)
+        ) {
+            self.begin_identity_persistence(msg);
             return changed;
         }
 

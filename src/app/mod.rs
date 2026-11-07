@@ -144,6 +144,12 @@ pub struct App {
     next_agent_resume_at: Option<Instant>,
     pub(crate) session_save_deadline: Option<Instant>,
     pub(crate) session_save_thread: Option<std::thread::JoinHandle<()>>,
+    pub(crate) ordered_save_pending: bool,
+    pub(crate) defer_pane_checkpoint: bool,
+    pub(crate) pending_pane_checkpoint: Option<(
+        crate::events::AppEvent,
+        Vec<crate::app::actions::PaneStateUpdate>,
+    )>,
     session_writer: Arc<std::sync::Mutex<crate::persist::SessionWriter>>,
     pane_exit_checkpoint_pending: bool,
     pub(crate) detached_process_children: Vec<std::process::Child>,
@@ -657,6 +663,9 @@ impl App {
             next_agent_resume_at: None,
             session_save_deadline: None,
             session_save_thread: None,
+            ordered_save_pending: false,
+            defer_pane_checkpoint: false,
+            pending_pane_checkpoint: None,
             session_writer,
             pane_exit_checkpoint_pending: false,
             detached_process_children: Vec::new(),
@@ -3195,6 +3204,180 @@ mod tests {
             app.next_headless_loop_deadline_with_git_refresh(now, false, true),
             None
         );
+    }
+
+    #[test]
+    fn interrupted_exit_suspends_at_checkpoint_and_resumes_once() {
+        let mut app = test_app();
+        app.policy.persist_session = true;
+        let workspace = Workspace::test_new("phase-split");
+        let pane_id = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        app.defer_pane_checkpoint = true;
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id,
+            exit_reason: crate::platform::ChildExitReason::Interrupted,
+        });
+        app.defer_pane_checkpoint = false;
+        assert!(app.pending_pane_checkpoint.is_some());
+        assert!(app.find_pane(pane_id).is_some());
+        app.accept_deferred_pane_checkpoint();
+        assert!(app.resume_checkpointed_pane_event().is_some());
+        assert!(app.find_pane(pane_id).is_none());
+        assert!(app.resume_checkpointed_pane_event().is_none());
+    }
+
+    #[test]
+    fn normal_exit_does_not_suspend_at_checkpoint() {
+        let mut app = test_app();
+        app.policy.persist_session = true;
+        let workspace = Workspace::test_new("normal-exit");
+        let pane_id = workspace.tabs[0].root_pane;
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        app.defer_pane_checkpoint = true;
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id,
+            exit_reason: crate::platform::ChildExitReason::Exited,
+        });
+        assert!(app.pending_pane_checkpoint.is_none());
+        assert!(app.find_pane(pane_id).is_none());
+    }
+
+    #[test]
+    fn deferred_identity_save_refuses_busy_writer_without_waiting() {
+        let mut app = test_app();
+        app.policy.persist_session = true;
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        app.session_save_thread = Some(std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        }));
+        started_rx.recv().unwrap();
+        let result = app.start_deferred_identity_save();
+        assert!(matches!(result, Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock));
+        release_tx.send(()).unwrap();
+        app.session_save_thread.take().unwrap().join().unwrap();
+    }
+
+    #[test]
+    fn deferred_identity_save_writes_uuid_before_completion() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let config_home = unique_temp_path("deferred-identity-save");
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        let mut app = test_app();
+        app.policy.persist_session = true;
+        let mut workspace = Workspace::test_new("identity");
+        workspace.instance_id = Some("d9b5081b-9988-45a0-87ad-b03f36b6ec26".into());
+        app.state.workspaces = vec![workspace];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        let completion = app.start_deferred_identity_save().unwrap();
+        completion
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(app.start_deferred_identity_save(), Err(ref error)
+            if error.kind() == std::io::ErrorKind::WouldBlock));
+        app.finish_deferred_save();
+        let snapshot = crate::persist::load().unwrap();
+        assert_eq!(
+            snapshot.workspaces[0].instance_id.as_deref(),
+            Some("d9b5081b-9988-45a0-87ad-b03f36b6ec26")
+        );
+        app.session_save_thread.take().unwrap().join().unwrap();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn deferred_checkpoint_preserves_pre_exit_snapshot() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let config_home = unique_temp_path("deferred-pane-checkpoint");
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        let mut app = test_app();
+        app.policy.persist_session = true;
+        app.state.workspaces = vec![Workspace::test_new("preserved")];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        let completion = app.start_deferred_pane_checkpoint().unwrap();
+        completion
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(app.start_deferred_identity_save(), Err(ref error)
+            if error.kind() == std::io::ErrorKind::WouldBlock));
+        let snapshot = crate::persist::load().unwrap();
+        assert_eq!(
+            snapshot.workspaces[0].custom_name.as_deref(),
+            Some("preserved")
+        );
+        app.finish_deferred_save();
+        app.session_save_thread.take().unwrap().join().unwrap();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn deferred_checkpoint_reports_history_write_failure() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let config_home = unique_temp_path("deferred-pane-history-failure");
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        let mut app = test_app();
+        app.policy.persist_session = true;
+        app.state.workspaces = vec![Workspace::test_new("preserved")];
+        app.state.active = Some(0);
+        app.state.ensure_test_terminals();
+        std::fs::create_dir_all(crate::session::data_dir().join("session-history.json")).unwrap();
+        let completion = app.start_deferred_pane_checkpoint().unwrap();
+        assert!(completion
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .is_err());
+        assert!(
+            crate::persist::load().is_some(),
+            "layout may be committed before history fails"
+        );
+        app.finish_deferred_save();
+        app.session_save_thread.take().unwrap().join().unwrap();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(config_home);
+    }
+
+    #[test]
+    fn deferred_shutdown_preserves_clean_exit_checkpoint() {
+        let mut app = test_app();
+        app.policy.persist_session = true;
+        app.accept_deferred_pane_checkpoint();
+        assert!(app.start_deferred_shutdown_save().unwrap().is_none());
+    }
+
+    #[test]
+    fn deferred_shutdown_clear_reports_history_error() {
+        let _guard = crate::config::test_config_env_lock().lock().unwrap();
+        let config_home = unique_temp_path("deferred-shutdown-history-failure");
+        std::env::set_var("XDG_CONFIG_HOME", &config_home);
+        std::env::remove_var(crate::session::SESSION_ENV_VAR);
+        let mut app = test_app();
+        app.policy.persist_session = true;
+        app.state.workspaces.clear();
+        std::fs::create_dir_all(crate::session::data_dir().join("session-history.json")).unwrap();
+        let completion = app.start_deferred_shutdown_save().unwrap().unwrap();
+        assert!(completion
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .is_err());
+        app.finish_deferred_save();
+        app.session_save_thread.take().unwrap().join().unwrap();
+        std::env::remove_var("XDG_CONFIG_HOME");
+        let _ = std::fs::remove_dir_all(config_home);
     }
 
     #[test]

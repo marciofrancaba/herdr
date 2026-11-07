@@ -11,6 +11,73 @@ use super::super::api_helpers::{normalize_metadata_source, normalize_metadata_tt
 use super::responses::{encode_error, encode_success};
 
 impl App {
+    pub(super) fn handle_workspace_identity(
+        &mut self,
+        id: String,
+        target: WorkspaceTarget,
+    ) -> String {
+        let (index, instance_id) = match self.prepare_workspace_identity(&id, &target) {
+            Ok(identity) => identity,
+            Err(response) => return response,
+        };
+        if let Err(err) = self.persist_workspace_identity_now() {
+            return encode_error(
+                id,
+                "workspace_identity_uncommitted",
+                format!("Workspace identity durability is unknown: {err}"),
+            );
+        }
+        encode_success(
+            id,
+            ResponseResult::WorkspaceIdentity {
+                workspace_id: self.public_workspace_id(index),
+                instance_id,
+            },
+        )
+    }
+    // Split admission from persistence so a deferred handler can retain the
+    // exact target identity and revalidate it after a durable completion.
+    pub(crate) fn prepare_workspace_identity(
+        &mut self,
+        id: &str,
+        target: &WorkspaceTarget,
+    ) -> Result<(usize, String), String> {
+        let Some(index) = self.parse_workspace_id(&target.workspace_id) else {
+            return Err(workspace_not_found(id.to_owned(), &target.workspace_id));
+        };
+        let Some(workspace) = self.state.workspaces.get_mut(index) else {
+            return Err(workspace_not_found(id.to_owned(), &target.workspace_id));
+        };
+        let instance_id = workspace
+            .instance_id
+            .get_or_insert_with(|| uuid::Uuid::new_v4().to_string())
+            .clone();
+        let valid = uuid::Uuid::parse_str(&instance_id).ok().filter(|value| {
+            value.get_version_num() == 4 && !value.is_nil() && value.to_string() == instance_id
+        });
+        if valid.is_none()
+            || self
+                .state
+                .workspaces
+                .iter()
+                .filter(|ws| {
+                    ws.instance_id
+                        .as_deref()
+                        .and_then(|raw| uuid::Uuid::parse_str(raw).ok())
+                        == valid
+                })
+                .count()
+                != 1
+        {
+            return Err(encode_error(
+                id.to_owned(),
+                "workspace_identity_ambiguous",
+                "Workspace identity is invalid or duplicated",
+            ));
+        }
+        Ok((index, instance_id))
+    }
+
     pub(super) fn handle_workspace_list(&mut self, id: String) -> String {
         encode_success(
             id,
