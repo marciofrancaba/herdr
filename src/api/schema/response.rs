@@ -51,6 +51,10 @@ pub enum ResponseResult {
     SessionSnapshot {
         snapshot: Box<SessionSnapshot>,
     },
+    WorkspaceIdentity {
+        workspace_id: String,
+        instance_id: String,
+    },
     WorkspaceInfo {
         workspace: WorkspaceInfo,
     },

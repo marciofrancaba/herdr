@@ -274,10 +274,39 @@ impl App {
                 exit_reason,
             } if exit_reason.requires_session_checkpoint() && self.find_pane(*pane_id).is_some() && !self.overlay_panes.contains_key(pane_id)
         );
+        if checkpointed_pane_exit
+            && self.defer_pane_checkpoint
+            && self.policy.persist_session
+            && !(self.pane_exit_checkpoint_pending && !self.state.session_dirty)
+        {
+            assert!(
+                self.pending_pane_checkpoint.is_none(),
+                "checkpoint continuation already pending"
+            );
+            self.pending_pane_checkpoint = Some((ev, worktree_restore_updates));
+            return Vec::new();
+        }
         if checkpointed_pane_exit {
             self.checkpoint_session_before_pane_exit();
         }
+        self.finish_prepared_internal_event(ev, worktree_restore_updates, checkpointed_pane_exit)
+    }
 
+    // Resume after the pre-checkpoint effects have run, without replaying them.
+    // The caller must gate mutations and consume a successful save first.
+    pub(crate) fn resume_checkpointed_pane_event(
+        &mut self,
+    ) -> Option<Vec<crate::app::actions::PaneStateUpdate>> {
+        let (ev, updates) = self.pending_pane_checkpoint.take()?;
+        Some(self.finish_prepared_internal_event(ev, updates, true))
+    }
+
+    fn finish_prepared_internal_event(
+        &mut self,
+        ev: AppEvent,
+        worktree_restore_updates: Vec<crate::app::actions::PaneStateUpdate>,
+        checkpointed_pane_exit: bool,
+    ) -> Vec<crate::app::actions::PaneStateUpdate> {
         let overlay_state = if let AppEvent::PaneDied { pane_id, .. } = &ev {
             self.overlay_panes.remove(pane_id).map(|overlay| {
                 let was_overlay_active =
@@ -1061,6 +1090,9 @@ impl App {
             Method::SessionSnapshot(_) => return self.handle_session_snapshot(request.id),
             Method::WorkspaceList(_) => return self.handle_workspace_list(request.id),
             Method::WorkspaceGet(target) => return self.handle_workspace_get(request.id, target),
+            Method::WorkspaceIdentityEnsureDurable(target) => {
+                return self.handle_workspace_identity(request.id, target)
+            }
             Method::WorkspaceCreate(params) => {
                 return self.handle_workspace_create(request.id, params);
             }
@@ -2277,6 +2309,40 @@ mod tests {
         assert_eq!(tab.layout.focused(), previous_focus);
         assert!(!tab.zoomed);
         assert!(app.overlay_panes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn interrupted_respawn_completes_without_staged_checkpoint() {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let workspace = crate::workspace::Workspace::test_new("respawn-before-checkpoint");
+        app.state.default_shell = test_support::exiting_test_command().into();
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .respawn_shell_on_exit = true;
+        app.policy.persist_session = true;
+        app.defer_pane_checkpoint = true;
+        app.handle_internal_event(AppEvent::PaneDied {
+            pane_id,
+            exit_reason: crate::platform::ChildExitReason::Interrupted,
+        });
+        assert!(app.pending_pane_checkpoint.is_none());
+        assert!(app.find_pane(pane_id).is_some());
+        for (_, runtime) in app.terminal_runtimes.drain() {
+            runtime.shutdown();
+        }
     }
 
     #[tokio::test]

@@ -50,6 +50,8 @@ pub struct TabHistorySnapshot {
 
 #[derive(Serialize, Deserialize)]
 pub struct WorkspaceSnapshot {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance_id: Option<String>,
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
@@ -166,6 +168,7 @@ impl From<LegacyWorkspaceSnapshot> for WorkspaceSnapshot {
 
         Self {
             id: None,
+            instance_id: None,
             custom_name: snap.custom_name,
             identity_cwd,
             worktree_space: None,
@@ -304,6 +307,7 @@ fn capture_workspace(
         .unwrap_or_else(|| ws.identity_cwd.clone());
     WorkspaceSnapshot {
         id: Some(ws.id.clone()),
+        instance_id: ws.instance_id.clone(),
         custom_name: ws.custom_name.clone(),
         identity_cwd,
         worktree_space: ws.worktree_space.clone(),
@@ -401,10 +405,15 @@ fn capture_tab(
     }
 }
 
-pub(super) fn layout_fingerprint(snapshot: &SessionSnapshot) -> Option<String> {
+pub(crate) fn layout_fingerprint(snapshot: &SessionSnapshot) -> Option<String> {
     use sha2::{Digest, Sha256};
 
     let mut value = serde_json::to_value(snapshot).ok()?;
+    // Identity is not part of pane layout. Excluding it preserves fingerprints
+    // created by versions that predate workspace instance identities.
+    for workspace in value.get_mut("workspaces")?.as_array_mut()? {
+        workspace.as_object_mut()?.remove("instance_id");
+    }
     // Sets serialize as arrays; normalize their order as well as JSON object keys.
     let mut collapsed: Vec<_> = snapshot.collapsed_space_keys.iter().collect();
     collapsed.sort_unstable();
@@ -566,6 +575,42 @@ mod tests {
         capture_from_state_with_runtimes(state, &terminal_runtimes)
     }
 
+    #[test]
+    fn workspace_instance_roundtrip_survives_rename() {
+        let mut state = state_with_workspaces(&["before"]);
+        state.workspaces[0].instance_id = Some("d9b5081b-9988-45a0-87ad-b03f36b6ec26".into());
+        state.workspaces[0].set_custom_name("after".into());
+        let encoded = serde_json::to_string(&capture_from_state(&state)).unwrap();
+        let restored = parse_snapshot(&encoded).unwrap();
+        assert_eq!(
+            restored.workspaces[0].instance_id.as_deref(),
+            Some("d9b5081b-9988-45a0-87ad-b03f36b6ec26")
+        );
+    }
+
+    #[test]
+    fn workspace_instance_does_not_invalidate_history_fingerprint() {
+        let mut state = state_with_workspaces(&["workspace"]);
+        let before = capture_from_state(&state);
+        state.workspaces[0].instance_id = Some("d9b5081b-9988-45a0-87ad-b03f36b6ec26".into());
+        let after = capture_from_state(&state);
+        assert_eq!(layout_fingerprint(&before), layout_fingerprint(&after));
+        state.workspaces[0].set_custom_name("other".into());
+        assert_ne!(
+            layout_fingerprint(&before),
+            layout_fingerprint(&capture_from_state(&state))
+        );
+    }
+
+    #[test]
+    fn legacy_workspace_has_no_instance_identity() {
+        let snapshot = parse_snapshot(session_fixture("current-herdr")).unwrap();
+        assert!(snapshot
+            .workspaces
+            .iter()
+            .all(|workspace| workspace.instance_id.is_none()));
+    }
+
     fn capture_from_state_with_runtimes(
         state: &AppState,
         terminal_runtimes: &TerminalRuntimeRegistry,
@@ -724,6 +769,7 @@ mod tests {
 
         let snap = SessionSnapshot {
             workspaces: vec![WorkspaceSnapshot {
+                instance_id: None,
                 id: Some("wproj".to_string()),
                 custom_name: Some("pi-mono".to_string()),
                 identity_cwd: PathBuf::from("/home/can/Projects/herdr"),
@@ -1425,6 +1471,7 @@ mod tests {
         let snap = SessionSnapshot {
             version: SNAPSHOT_VERSION,
             workspaces: vec![WorkspaceSnapshot {
+                instance_id: None,
                 id: Some("test-ws".to_string()),
                 custom_name: Some("fallback test".to_string()),
                 identity_cwd: PathBuf::from("/tmp"),

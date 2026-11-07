@@ -174,6 +174,8 @@ pub(crate) fn reserve_workspace_ids(workspaces: &[Workspace]) {
 
 /// A named workspace containing tabs.
 pub struct Workspace {
+    /// Opaque identity, allocated by the durable-identity API.
+    pub(crate) instance_id: Option<String>,
     /// Stable public workspace identity, independent of display order.
     pub id: String,
     /// User-provided override. If set, auto-derived identity stops updating.
@@ -251,6 +253,7 @@ impl Workspace {
             discover_workspace_git_identity(&identity_cwd);
         Self {
             id,
+            instance_id: None,
             custom_name: label,
             identity_cwd: identity_cwd.clone(),
             cached_identity_cwd: identity_cwd.clone(),
@@ -403,6 +406,7 @@ impl Workspace {
         Ok((
             Self {
                 id,
+                instance_id: None,
                 custom_name: None,
                 identity_cwd: initial_cwd.clone(),
                 cached_identity_cwd: initial_cwd.clone(),
@@ -1192,6 +1196,7 @@ impl Workspace {
         public_pane_numbers.insert(tab.root_pane, 1);
         Self {
             id: generate_workspace_id(),
+            instance_id: None,
             custom_name: Some(name.to_string()),
             identity_cwd: identity_cwd.clone(),
             cached_identity_cwd: identity_cwd.clone(),

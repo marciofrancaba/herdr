@@ -19,7 +19,7 @@ impl HeadlessServer {
             .unwrap_or(crate::detect::AgentState::Unknown)
     }
 
-    fn forward_semantic_agent_notification(
+    pub(super) fn forward_semantic_agent_notification(
         &mut self,
         update: &crate::app::actions::PaneStateUpdate,
     ) -> bool {
@@ -108,7 +108,7 @@ impl HeadlessServer {
         ))
     }
 
-    fn forward_pane_state_update_notifications_to_clients(
+    pub(super) fn forward_pane_state_update_notifications_to_clients(
         &mut self,
         update: &crate::app::actions::PaneStateUpdate,
     ) {
@@ -675,23 +675,24 @@ impl HeadlessServer {
                     }
                 }
 
+                self.app.defer_pane_checkpoint = true;
                 let pane_updates = self.app.handle_internal_event_with_pane_updates(ev);
+                self.app.defer_pane_checkpoint = false;
+                let completion = super::ordered_persistence::PaneCompletion {
+                    pane_id: pane_id_val,
+                    terminal_id,
+                    focus_before,
+                    focused_tabs_before,
+                };
+                if self.app.pending_pane_checkpoint.is_some() {
+                    self.defer_pane_completion(completion);
+                    return true;
+                }
                 for update in &pane_updates {
                     self.forward_semantic_agent_notification(update);
                     self.forward_pane_state_update_notifications_to_clients(update);
                 }
-                self.reconcile_client_shell_locations();
-                self.finish_shell_location_reconciliation(focus_before, &focused_tabs_before);
-                self.reapply_controlled_shell_tab_geometry(false);
-
-                if self.app.find_pane(pane_id_val).is_none() {
-                    if let Some(terminal_id) = terminal_id {
-                        self.shutdown_terminal_stream_clients(
-                            &terminal_id,
-                            format!("terminal {terminal_id} exited"),
-                        );
-                    }
-                }
+                self.finish_pane_completion(completion);
 
                 true
             }
@@ -734,7 +735,7 @@ impl HeadlessServer {
         let mut had_event = false;
         let mut changed = false;
         for _ in 0..limit {
-            if self.host_shutdown_requested() {
+            if self.host_shutdown_requested() || self.persistence_pending() {
                 break;
             }
             let Ok(ev) = self.app.event_rx.try_recv() else {

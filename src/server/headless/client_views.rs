@@ -811,6 +811,11 @@ impl HeadlessServer {
         &mut self,
         mut msg: api::ApiRequestMessage,
     ) -> bool {
+        let drained = self.drain_all_internal_events_with_forwarding();
+        if self.persistence_pending() {
+            self.answer_during_persistence(msg);
+            return drained;
+        }
         let target_before = self.default_shell_target();
         let popup_before = self.app.state.popup_pane.is_some();
         let method_claims_geometry = Self::public_request_may_change_geometry(&msg.request.method);
@@ -864,7 +869,11 @@ impl HeadlessServer {
             (original, proxy_rx)
         });
         let reconcile = Self::shell_locations_may_need_reconcile(&msg.request.method);
-        let changed = self.handle_api_request_with_shutdown_check_inner(msg, false, false);
+        let changed =
+            drained | self.handle_api_request_with_shutdown_check_inner(msg, false, false);
+        if self.persistence_pending() {
+            return changed;
+        }
         let proxied_result = forward_proxied_api_response(response_proxy);
         let proxied_request_succeeded = proxied_result.is_some();
         // Same-tab and zoomed moves succeed without moving or requesting focus.
@@ -912,6 +921,11 @@ impl HeadlessServer {
         client_id: u64,
         msg: api::ApiRequestMessage,
     ) -> bool {
+        let drained = self.drain_all_internal_events_with_forwarding();
+        if self.persistence_pending() {
+            self.answer_during_persistence(msg);
+            return drained;
+        }
         let focus_before = self.shell_focus_target(client_id);
         let focused_tabs_before = self.focused_shell_tabs();
         let method_claims_geometry = Self::shell_endpoint_claims_geometry(&msg.request.method);
@@ -922,7 +936,10 @@ impl HeadlessServer {
         self.set_default_shell_target_from_client(client_id);
         let popup_before = self.app.state.popup_pane.is_some();
         let popup_owner = self.shell_tab_id_for_client(client_id);
-        let changed = self.handle_api_request_with_shutdown_check_inner(msg, false, true);
+        let changed = drained | self.handle_api_request_with_shutdown_check_inner(msg, false, true);
+        if self.persistence_pending() {
+            return changed;
+        }
         self.focus_shell_client_on_default_target(client_id);
         if !popup_before && self.app.state.popup_pane.is_some() {
             self.popup_owner_tab_id = popup_owner;

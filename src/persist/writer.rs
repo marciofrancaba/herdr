@@ -40,22 +40,69 @@ impl SessionWriter {
         snapshot: &SessionSnapshot,
         history: Option<&SessionHistorySnapshot>,
     ) {
-        let result = self.preserve_unloaded().and_then(|()| {
-            self.preserve_snapshot_history();
-            super::io::save_to_path(&self.path, snapshot)
-        });
-        if let Err(err) = result {
+        if let Err(err) = self.save_checked(snapshot, history) {
             crate::logging::session_save_failed(&self.path, &err.to_string());
-            return;
         }
-        // Optional history failure must not reclassify our committed layout as unloaded.
-        self.protect_unloaded = false;
-        self.preserve_snapshot_history();
+    }
+
+    // Identity acknowledgement needs the outcome of the layout write. A
+    // history failure is still optional and does not undo the committed layout.
+    pub(crate) fn save_checked(
+        &mut self,
+        snapshot: &SessionSnapshot,
+        history: Option<&SessionHistorySnapshot>,
+    ) -> io::Result<()> {
+        self.save_layout_checked(snapshot)?;
         let history_path = self.path.with_file_name("session-history.json");
         if let Err(err) = super::io::save_history_to_path(&history_path, history) {
             crate::logging::session_save_failed(&history_path, &err.to_string());
         }
+        Ok(())
+    }
+
+    // Pane-exit completion is not successful when its history write failed.
+    // Layout may already have been written on error; callers must treat it as
+    // unknown and must not replay the exit solely on that error.
+    pub(crate) fn save_checkpoint_checked(
+        &mut self,
+        snapshot: &SessionSnapshot,
+        history: Option<&SessionHistorySnapshot>,
+    ) -> io::Result<()> {
+        self.save_layout_checked(snapshot)?;
+        let history_path = self.path.with_file_name("session-history.json");
+        super::io::save_history_to_path(&history_path, history)
+    }
+
+    pub(crate) fn save_layout_checked(&mut self, snapshot: &SessionSnapshot) -> io::Result<()> {
+        self.preserve_unloaded().and_then(|()| {
+            self.preserve_snapshot_history();
+            super::io::save_to_path(&self.path, snapshot)
+        })?;
+        // Optional history failure must not reclassify our committed layout as unloaded.
+        self.protect_unloaded = false;
+        self.preserve_snapshot_history();
         crate::logging::session_saved(&self.path, snapshot.workspaces.len());
+        Ok(())
+    }
+
+    pub(crate) fn save_identity_layout_checked(
+        &mut self,
+        snapshot: &SessionSnapshot,
+    ) -> io::Result<()> {
+        super::io::reject_symlink_identity_route(&self.path)?;
+        self.save_layout_checked(snapshot)?;
+        super::io::sync_target_ancestor_directories(&self.path)
+    }
+
+    // Shutdown completion must surface both layout and history errors.
+    pub(crate) fn clear_checked(&mut self) -> io::Result<()> {
+        self.preserve_unloaded()?;
+        self.preserve_snapshot_history();
+        super::io::clear_path(&self.path)?;
+        let history_path = self.path.with_file_name("session-history.json");
+        super::io::clear_path(&history_path)?;
+        crate::logging::session_cleared(&self.path);
+        Ok(())
     }
 
     pub(crate) fn clear(&mut self) {
@@ -313,6 +360,25 @@ mod tests {
 
     fn snapshots(writer: &SessionWriter) -> Vec<(u128, PathBuf)> {
         recovery_files(&writer.path.with_file_name("session-snapshots")).unwrap()
+    }
+
+    #[test]
+    fn checked_save_returns_only_after_layout_is_readable() {
+        let mut writer = writer(false);
+        writer.save_checked(&snapshot(), None).unwrap();
+        let saved: SessionSnapshot =
+            serde_json::from_slice(&std::fs::read(&writer.path).unwrap()).unwrap();
+        assert_eq!(saved.workspaces.len(), snapshot().workspaces.len());
+        std::fs::remove_dir_all(writer.path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn checked_save_reports_layout_write_failure() {
+        let mut writer = writer(false);
+        std::fs::create_dir(&writer.path).unwrap();
+        assert!(writer.save_checked(&snapshot(), None).is_err());
+        assert!(writer.path.is_dir());
+        std::fs::remove_dir_all(writer.path.parent().unwrap()).unwrap();
     }
 
     #[test]

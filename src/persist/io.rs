@@ -46,6 +46,41 @@ pub(super) fn save_to_path(path: &Path, snapshot: &SessionSnapshot) -> std::io::
     save_json_to_path(path, snapshot)
 }
 
+// Identity acknowledgement does not yet qualify the durability of symlink
+// routing entries. Refuse these routes before writing the layout.
+pub(super) fn reject_symlink_identity_route(path: &Path) -> std::io::Result<()> {
+    if !path.is_absolute() {
+        return Err(std::io::Error::other("identity path is not absolute"));
+    }
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component.as_os_str());
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(std::io::Error::other("identity path contains a symlink"));
+            }
+            Ok(_) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => break,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
+}
+
+// Used only by durable identity acknowledgement. A newly created session
+// directory must itself be made durable in each of its containing directories.
+pub(super) fn sync_target_ancestor_directories(path: &Path) -> std::io::Result<()> {
+    let target = resolve_write_target(path)?;
+    let mut directory = std::fs::canonicalize(target.parent().unwrap_or_else(|| Path::new(".")))?;
+    loop {
+        crate::platform::sync_parent_directory(&directory)?;
+        if !directory.pop() {
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn save_json_to_path<T: serde::Serialize>(path: &Path, snapshot: &T) -> std::io::Result<()> {
     let target = resolve_write_target(path)?;
     if let Some(parent) = target.parent() {
